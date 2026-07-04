@@ -1,0 +1,23 @@
+[package]
+name = "huohuo_companion"
+version = "0.1.0"
+description = "A Live2D desktop companion launcher for Archive and Folia"
+authors = ["laeglaur"]
+edition = "2021"
+
+[lib]
+name = "huohuo_companion_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api", "protocol-asset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tauri-plugin-global-shortcut = "2.3.2"
+
+[dev-dependencies]
+tempfile = "3"
