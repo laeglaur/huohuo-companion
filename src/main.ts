@@ -10,7 +10,7 @@ const BASE_HEIGHT = 420;
 const MIN_BASE_WIDTH = 120;
 const MAX_BASE_WIDTH = 360;
 const WIDTH_PADDING = 18;
-const MIN_SCALE = 0.75;
+const MIN_SCALE = 0.45;
 const MAX_SCALE = 1.8;
 const PET_HORIZONTAL_INSET = 4;
 const PET_VERTICAL_INSET = 10;
@@ -18,6 +18,7 @@ const CROP_PADDING = 6;
 const MAX_WINDOW_CROP_RATIO = 0.22;
 const CROP_ALPHA_THRESHOLD = 8;
 const ENABLE_RUNTIME_BOUNDS = true;
+const ENABLE_REACTION_BOUNDS = false;
 const BOUNDS_SETTLE_FRAMES = 8;
 const EXPRESSION_BOUNDS_SAMPLE_FRAMES = 36;
 const MOTION_BOUNDS_SAMPLE_FRAMES = 180;
@@ -322,6 +323,7 @@ function currentModelBounds(boundsKey = activeBoundsKey) {
 }
 
 async function setActiveBoundsKey(boundsKey: string) {
+  if (boundsKey !== "normal" && !ENABLE_REACTION_BOUNDS) return;
   if (activeBoundsKey === boundsKey) {
     currentVisibleBounds = visibleBoundsForCurrentWindow();
     positionBubble();
