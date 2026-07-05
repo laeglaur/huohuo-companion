@@ -177,6 +177,30 @@ fn save_settings(app: AppHandle, settings: CompanionSettings) -> Result<(), Stri
 }
 
 #[tauri::command]
+fn is_bounds_calibration_mode() -> bool {
+    std::env::var("HUOHUO_BOUNDS_CALIBRATE")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn write_precomputed_bounds(bounds_json: String) -> Result<(), String> {
+    let output_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or_else(|| "Could not resolve project root.".to_string())?
+        .join("src")
+        .join("modelBounds.generated.ts");
+    let parsed: serde_json::Value = serde_json::from_str(&bounds_json)
+        .map_err(|error| format!("Could not parse generated bounds JSON: {error}"))?;
+    let pretty = serde_json::to_string_pretty(&parsed)
+        .map_err(|error| format!("Could not format generated bounds JSON: {error}"))?;
+    let text = format!(
+        "import type {{ ModelBoundsSet }} from \"./modelBoundsTypes\";\n\nexport const PRECOMPUTED_MODEL_BOUNDS: Record<string, ModelBoundsSet> = {pretty};\n"
+    );
+    fs::write(output_path, text).map_err(|error| format!("Could not write bounds file: {error}"))
+}
+
+#[tauri::command]
 fn discover_models() -> Result<Vec<CompanionModel>, String> {
     Ok(discover_models_in_paths(
         Path::new(HUUOHUO_DIR),
@@ -1239,6 +1263,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_settings,
             save_settings,
+            is_bounds_calibration_mode,
+            write_precomputed_bounds,
             log_event,
             discover_models,
             model_reactions,

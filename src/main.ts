@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, LogicalSize, PhysicalPosition } from "@tauri-apps/api/window";
 import "./styles.css";
 import type { Live2DModel, PixiApplication } from "./global";
+import { PRECOMPUTED_MODEL_BOUNDS } from "./modelBounds.generated";
+import type { ModelBounds, ModelBoundsSet } from "./modelBoundsTypes";
 
 const DEFAULT_MODEL_PATH = "/Users/laeglaur/Documents/code/record/huohuo/huohuo.model3.json";
 const BASE_HEIGHT = 420;
@@ -15,7 +17,7 @@ const PET_VERTICAL_INSET = 10;
 const CROP_PADDING = 6;
 const MAX_WINDOW_CROP_RATIO = 0.22;
 const CROP_ALPHA_THRESHOLD = 8;
-const MODEL_BOUNDS_STORAGE_KEY = "huohuo.modelBounds.reactions.v1";
+const ENABLE_RUNTIME_BOUNDS = true;
 const BOUNDS_SETTLE_FRAMES = 8;
 const MOTION_BOUNDS_SAMPLE_FRAMES = 180;
 const BUBBLE_GAP = 8;
@@ -103,27 +105,9 @@ let reactionResetTimer = 0;
 let reactionQueue: ReactionState[] = [];
 let lastReactionKey = "";
 let activeBoundsKey = "normal";
-let boundsCalibrationPromise: Promise<void> | null = null;
-let pendingBoundsCalibration: { modelPath: string; source: string; reactions: CompanionReaction[] } | null = null;
 
 type ReactionState = { kind: "normal" } | CompanionReaction;
 let reactionState: ReactionState = { kind: "normal" };
-
-interface ModelBounds {
-  left: number;
-  top: number;
-  right: number;
-  bottom: number;
-  width: number;
-  height: number;
-  measuredAt: number;
-}
-
-interface ModelBoundsSet {
-  normal?: ModelBounds;
-  reactions?: Record<string, ModelBounds>;
-  measuredAt?: number;
-}
 
 interface VisibleBounds {
   left: number;
@@ -135,25 +119,16 @@ interface VisibleBounds {
 }
 
 const modelBoundsCache: Record<string, ModelBoundsSet> = {};
-const PRECOMPUTED_MODEL_BOUNDS: Record<string, ModelBoundsSet> = {};
 
-function loadStoredModelBounds() {
+function loadPrecomputedModelBounds() {
   try {
-    const stored = {
-      ...PRECOMPUTED_MODEL_BOUNDS,
-      ...JSON.parse(localStorage.getItem(MODEL_BOUNDS_STORAGE_KEY) || "{}") as Record<string, ModelBoundsSet | ModelBounds>,
-    };
-    Object.entries(stored).forEach(([modelPath, value]) => {
+    Object.entries(PRECOMPUTED_MODEL_BOUNDS).forEach(([modelPath, value]) => {
       const boundsSet = normalizeBoundsSet(value);
       if (boundsSet) modelBoundsCache[modelPath] = boundsSet;
     });
   } catch (error) {
-    logEvent(`load stored bounds failed: ${String(error)}`);
+    logEvent(`load precomputed bounds failed: ${String(error)}`);
   }
-}
-
-function saveStoredModelBounds() {
-  localStorage.setItem(MODEL_BOUNDS_STORAGE_KEY, JSON.stringify(modelBoundsCache));
 }
 
 function normalizeBoundsSet(value: unknown): ModelBoundsSet | null {
@@ -218,6 +193,7 @@ const notebookSearchResults = document.querySelector<HTMLElement>("#notebookSear
 
 async function init() {
   logEvent("frontend init");
+  const isCalibrationMode = await invoke<boolean>("is_bounds_calibration_mode").catch(() => false);
   try {
     settings = await invoke<CompanionSettings>("load_settings");
   } catch (error) {
@@ -232,7 +208,7 @@ async function init() {
   }
   logEvent(`settings loaded: selected=${settings.selectedModelPath || ""}`);
   settings.modelScales ||= {};
-  loadStoredModelBounds();
+  loadPrecomputedModelBounds();
   if (settings.selectedModelPath && settings.modelScales[settings.selectedModelPath] == null) {
     settings.modelScales[settings.selectedModelPath] = clampScale(settings.scale);
   }
@@ -243,12 +219,37 @@ async function init() {
     models = [];
   }
   logEvent(`discovered models: ${models.length}`);
+  if (isCalibrationMode) {
+    await runBoundsCalibrationMode();
+    return;
+  }
   if (settings.position) {
     await appWindow.setPosition(new PhysicalPosition(settings.position.x, settings.position.y));
   }
   const selected = settings.selectedModelPath || DEFAULT_MODEL_PATH;
   await applyScale(scaleForModel(selected));
   await loadModel(selected, true);
+}
+
+async function runBoundsCalibrationMode() {
+  speak("正在离线采样透明框。");
+  const results: Record<string, ModelBoundsSet> = {};
+  for (const model of models) {
+    try {
+      logEvent(`alpha bounds batch model start: ${model.modelPath}`);
+      const { url: source } = await invoke<ModelUrlResult>("model_asset_url", { modelPath: model.modelPath });
+      const reactions = await invoke<CompanionReaction[]>("model_reactions", { modelPath: model.modelPath });
+      const calibrationReactions = reactions.filter((reaction) => reaction.kind === "motion" || reaction.kind === "expression");
+      const bounds = await calibrateModelBounds(model.modelPath, source, calibrationReactions);
+      if (bounds) results[model.modelPath] = bounds;
+    } catch (error) {
+      logEvent(`alpha bounds batch model failed ${model.modelPath}: ${String(error)}`);
+    }
+  }
+  await invoke("write_precomputed_bounds", { boundsJson: JSON.stringify(results) });
+  logEvent(`alpha bounds batch complete: models=${Object.keys(results).length}`);
+  speak("透明框采样完成。");
+  await invoke("quit_app").catch(() => undefined);
 }
 
 function speak(text: string) {
@@ -310,6 +311,7 @@ function modelBaseWidth(model: Live2DModel | null) {
 }
 
 function currentModelBounds(boundsKey = activeBoundsKey) {
+  if (!ENABLE_RUNTIME_BOUNDS) return null;
   const modelPath = settings.selectedModelPath || DEFAULT_MODEL_PATH;
   const boundsSet = modelBoundsCache[modelPath];
   if (!boundsSet) return null;
@@ -326,7 +328,9 @@ async function setActiveBoundsKey(boundsKey: string) {
     return;
   }
   activeBoundsKey = boundsKey;
-  await applyScale(scaleForModel());
+  if (currentModelBounds(boundsKey)) {
+    await applyScale(scaleForModel());
+  }
 }
 
 function modelExpressionNames(model: Live2DModel | null) {
@@ -586,7 +590,6 @@ async function loadModel(modelPath: string, allowFallback: boolean): Promise<boo
     activeBoundsKey = "normal";
     await applyScale(scaleForModel(modelPath));
     refreshLayout();
-    scheduleBoundsCalibration(modelPath, source);
     await saveCurrentSettings();
     logEvent(`loadModel success: ${modelPath}`);
     return true;
@@ -607,26 +610,6 @@ async function loadModel(modelPath: string, allowFallback: boolean): Promise<boo
   } finally {
     isSwitchingModel = false;
   }
-}
-
-function scheduleBoundsCalibration(modelPath: string, source: string, reactions = modelReactions) {
-  const boundsSet = modelBoundsCache[modelPath];
-  const calibrationReactions = reactions.filter((reaction) => reaction.kind === "motion" || reaction.kind === "expression");
-  const needsCalibration = !boundsSet?.normal || calibrationReactions.some((reaction) => !boundsSet.reactions?.[reactionKey(reaction)]);
-  if (!needsCalibration) return;
-  logEvent(`alpha bounds scheduled ${modelPath}`);
-  if (boundsCalibrationPromise) {
-    pendingBoundsCalibration = { modelPath, source, reactions: calibrationReactions };
-    return;
-  }
-  boundsCalibrationPromise = calibrateModelBounds(modelPath, source, calibrationReactions, true)
-    .catch((error) => logEvent(`alpha bounds background failed: ${String(error)}`))
-    .finally(() => {
-      boundsCalibrationPromise = null;
-      const pending = pendingBoundsCalibration;
-      pendingBoundsCalibration = null;
-      if (pending) scheduleBoundsCalibration(pending.modelPath, pending.source, pending.reactions);
-    });
 }
 
 function refreshLayout() {
@@ -656,20 +639,9 @@ async function calibrateModelBounds(
   modelPath: string,
   source: string,
   reactions: CompanionReaction[],
-  applyToCurrentModel = false,
-) {
-  const previous = modelBoundsCache[modelPath];
-  const missingReaction = reactions.some((reaction) => !previous?.reactions?.[reactionKey(reaction)]);
-  if (previous?.normal && !missingReaction) {
-    if (applyToCurrentModel) {
-      currentVisibleBounds = visibleBoundsForCurrentWindow();
-      positionBubble();
-    }
-    return;
-  }
-
+): Promise<ModelBoundsSet | null> {
   const Live2DModel = window.PIXI?.live2d?.Live2DModel;
-  if (!window.PIXI || !Live2DModel) return;
+  if (!window.PIXI || !Live2DModel) return null;
   logEvent(`alpha bounds calibration start ${modelPath}: reactions=${reactions.length}`);
 
   const calibrationCanvas = document.createElement("canvas");
@@ -687,8 +659,7 @@ async function calibrateModelBounds(
 
   let calibrationModel: Live2DModel | null = null;
   const nextBoundsSet: ModelBoundsSet = {
-    normal: previous?.normal,
-    reactions: { ...(previous?.reactions || {}) },
+    reactions: {},
     measuredAt: Date.now(),
   };
   try {
@@ -734,15 +705,9 @@ async function calibrateModelBounds(
     calibrationCanvas.remove();
   }
 
-  if (!nextBoundsSet.normal && !Object.keys(nextBoundsSet.reactions || {}).length) return;
-  modelBoundsCache[modelPath] = nextBoundsSet;
-  saveStoredModelBounds();
+  if (!nextBoundsSet.normal && !Object.keys(nextBoundsSet.reactions || {}).length) return null;
   logEvent(`alpha bounds set ${modelPath}: normal=${Boolean(nextBoundsSet.normal)} reactions=${Object.keys(nextBoundsSet.reactions || {}).length}`);
-
-  if (applyToCurrentModel && settings.selectedModelPath === modelPath) {
-    await applyScale(scaleForModel(modelPath));
-    refreshLayout();
-  }
+  return nextBoundsSet;
 }
 
 function visibleToModelBounds(modelPath: string, bounds: VisibleBounds | null): ModelBounds | null {
