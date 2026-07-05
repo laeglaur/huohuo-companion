@@ -990,16 +990,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             name = hotkey.get("Name") or Path(relative).name[:-len(".exp3.json")]
             expressions.append({"Name": name, "File": relative})
 
-        if expressions:
-            return expressions
-
         for expression_file in sorted(root.rglob("*.exp3.json"), key=lambda item: item.as_posix().lower()):
             relative_path = expression_file.relative_to(root)
             if any(part.startswith(".") for part in relative_path.parts):
                 continue
+            relative = relative_path.as_posix()
+            if relative in seen:
+                continue
+            seen.add(relative)
             expressions.append({
                 "Name": expression_file.name[:-len(".exp3.json")],
-                "File": relative_path.as_posix(),
+                "File": relative,
             })
         return expressions
 
@@ -1016,16 +1017,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             group = Path(relative).name[:-len(".motion3.json")]
             motions.setdefault(group, []).append({"File": relative})
 
-        if motions:
-            return motions
-
-        fallback = []
         for motion_file in sorted(root.rglob("*.motion3.json"), key=lambda item: item.as_posix().lower()):
             relative_path = motion_file.relative_to(root)
             if any(part.startswith(".") for part in relative_path.parts):
                 continue
-            fallback.append({"File": relative_path.as_posix()})
-        return {"TapBody": fallback} if fallback else {}
+            relative = relative_path.as_posix()
+            if relative in seen:
+                continue
+            seen.add(relative)
+            group = motion_file.name[:-len(".motion3.json")]
+            motions.setdefault(group, []).append({"File": relative})
+        return motions
 
 socketserver.ThreadingTCPServer.allow_reuse_address = True
 with socketserver.ThreadingTCPServer(("127.0.0.1", int(sys.argv[1])), Handler) as httpd:
@@ -1072,12 +1074,7 @@ fn wait_for_http(url: &str, timeout: Duration) -> Result<(), String> {
 }
 
 fn discover_reactions_in_dir(root: &Path) -> Vec<CompanionReaction> {
-    let hotkey_reactions = discover_vtube_hotkey_reactions(root);
-    if !hotkey_reactions.is_empty() {
-        return dedup_reactions(hotkey_reactions);
-    }
-
-    let mut reactions = Vec::new();
+    let mut reactions = discover_vtube_hotkey_reactions(root);
     for file in collect_files_with_suffix(root, ".motion3.json") {
         let name = model_asset_stem(&file, ".motion3.json");
         reactions.push(CompanionReaction {
@@ -1250,10 +1247,14 @@ fn dedup_reactions(reactions: Vec<CompanionReaction>) -> Vec<CompanionReaction> 
     let mut result = Vec::new();
     for reaction in reactions {
         let exists = result.iter().any(|existing: &CompanionReaction| {
-            existing.kind == reaction.kind
-                && existing.name == reaction.name
-                && existing.group == reaction.group
-                && existing.expression == reaction.expression
+            if existing.kind != reaction.kind {
+                return false;
+            }
+            match existing.kind.as_str() {
+                "motion" => existing.group == reaction.group,
+                "expression" => existing.expression == reaction.expression,
+                _ => existing.name == reaction.name,
+            }
         });
         if !exists {
             result.push(reaction);
@@ -1558,6 +1559,49 @@ mod tests {
         assert_eq!(reactions[0].kind, "expression");
         assert_eq!(reactions[0].name, "怖い顔");
         assert_eq!(reactions[0].expression.as_deref(), Some("kowai"));
+    }
+
+    #[test]
+    fn vtube_reactions_include_files_missing_from_hotkeys() {
+        let temp = tempfile::tempdir().unwrap();
+        let model_dir = temp.path().join("huohuo");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("qizi.motion3.json"), "{}").unwrap();
+        fs::write(model_dir.join("Scene1.motion3.json"), "{}").unwrap();
+        fs::write(model_dir.join("qizi1.exp3.json"), "{}").unwrap();
+        fs::write(
+            model_dir.join("huohuo.vtube.json"),
+            r#"{
+                "Hotkeys": [
+                    {
+                        "Name": "",
+                        "Action": "TriggerAnimation",
+                        "File": "qizi.motion3.json"
+                    },
+                    {
+                        "Name": "qizi1",
+                        "Action": "ToggleExpression",
+                        "File": "qizi1.exp3.json"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let reactions = discover_reactions_in_dir(&model_dir);
+        let keys: Vec<String> = reactions
+            .iter()
+            .map(|reaction| match reaction.kind.as_str() {
+                "motion" => format!("motion:{}", reaction.group.as_deref().unwrap_or("")),
+                "expression" => format!("expression:{}", reaction.expression.as_deref().unwrap_or("")),
+                _ => reaction.kind.clone(),
+            })
+            .collect();
+
+        assert!(keys.contains(&"motion:qizi".to_string()));
+        assert!(keys.contains(&"motion:Scene1".to_string()));
+        assert!(keys.contains(&"expression:qizi1".to_string()));
+        assert_eq!(keys.iter().filter(|key| key.as_str() == "motion:qizi").count(), 1);
     }
 
     #[test]

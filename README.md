@@ -95,15 +95,24 @@ Fields:
 - `foliaAppPath`: optional Folia app override. If unset, the app checks `/Applications` and `~/Applications`.
 - `foliaDataDir`: optional Folia data override. If unset, common Folia data folders are checked.
 
-## Alpha Bounds Cache
+## Alpha Bounds Onboarding
 
-On first startup, huohuo queues each discovered model for offline alpha-bounds sampling. The sampler renders the model, samples focus directions around 360 degrees, includes discovered motions/expressions, and writes cache files to:
+When a discovered model has no local alpha-bounds cache, huohuo shows an onboarding panel instead of silently running a long background scan. The panel lists the model's variable states, such as `normal`, expressions, and motions.
+
+For each state, move the pointer around the model to let it follow the view direction. huohuo temporarily reserves space above the model for the onboarding panel, continuously merges the rendered alpha bounds, and draws the exact padded box that will be saved. Then choose:
+
+- `确认`: save the current box for this state.
+- `继承选中`: reuse one of the saved candidate boxes when the visible size is effectively unchanged. Inherited boxes are not added back into the candidate list. Saved candidates appear as compact buttons in the panel; only the selected candidate is drawn as a dashed box over the model.
+- `重扫`: clear the current state and scan again.
+- `稍后`: stop onboarding and keep any completed cache.
+
+Cache files are written to:
 
 ```text
 local/bounds/
 ```
 
-Runtime reads this local cache on later starts. Cache files are ignored by git because they depend on each user's downloaded models and local paths.
+Runtime reads this local cache on later starts. The renderer keeps an invisible overscan buffer around the model so tails, noses, and accessories can extend beyond the default pose during onboarding. Confirmed states are also merged into the stable `normal` box so the window does not jitter between expressions while still leaving enough space for tails or accessories. Cache files are ignored by git because they depend on each user's downloaded models and local paths.
 
 ## Install From Source
 
@@ -272,15 +281,24 @@ cp local/config.example.json local/config.json
 - `foliaAppPath`：可选 Folia app 路径。不配置时，会自动检查 `/Applications` 和 `~/Applications`。
 - `foliaDataDir`：可选 Folia 数据目录。不配置时，会自动检查常见 Folia 数据目录。
 
-## 透明框缓存
+## 透明框入库
 
-第一次启动时，huohuo 会把所有已发现模型排队做离线 alpha 透明框采样。采样会渲染模型，覆盖 360 度方向的鼠标注视点，并纳入发现到的 motion/expression，然后写入：
+当某个模型没有本地透明框缓存时，huohuo 会显示入库面板，而不是静默跑很久的后台扫描。面板会列出这个模型的可变项，例如 `normal`、表情和动作。
+
+每个可变项里，用户移动鼠标让 Live2D 跟随视线方向；huohuo 会临时在模型上方留出入库面板空间，持续合并渲染后的 alpha 外框，并实时画出最终会保存的 padded 框。然后可以选择：
+
+- `确认`：保存当前可变项的框。
+- `继承选中`：如果这个状态和之前某个状态大小几乎一样，选择一个已保存候选框复用。继承出来的框不会再进入候选列表；已保存候选会显示为面板里的小按钮，只有当前选中的候选会作为虚线框画在模型上。
+- `重扫`：清空当前状态，重新扫描。
+- `稍后`：停止入库，并保留已经完成的缓存。
+
+缓存写入：
 
 ```text
 local/bounds/
 ```
 
-之后启动会直接读取这些本地缓存。缓存文件依赖用户下载的模型和本机路径，所以不会提交到 git。
+之后启动会直接读取这些本地缓存。渲染器会在模型四周保留不可见的 overscan 缓冲区，让尾巴、鼻子和附件能在入库时伸出默认姿态范围。所有确认过的状态也会合并进稳定的 `normal` 总框，这样运行时不需要在表情之间来回改窗口大小，也能给尾巴或附件留出空间。缓存文件依赖用户下载的模型和本机路径，所以不会提交到 git。
 
 ## 从源码安装
 

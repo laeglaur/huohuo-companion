@@ -13,8 +13,10 @@ const MIN_SCALE = 0.45;
 const MAX_SCALE = 1.8;
 const PET_HORIZONTAL_INSET = 4;
 const PET_VERTICAL_INSET = 10;
-const CROP_PADDING = 6;
-const MAX_WINDOW_CROP_RATIO = 0.22;
+const MODEL_OVERSCAN = { left: 48, top: 32, right: 104, bottom: 48 };
+const CROP_PADDING = { left: 12, top: 12, right: 28, bottom: 16 };
+const MANUAL_BOUNDS_PADDING = { left: 14, top: 14, right: 30, bottom: 18 };
+const MAX_WINDOW_CROP_RATIO = 0.38;
 const CROP_ALPHA_THRESHOLD = 8;
 const ENABLE_RUNTIME_BOUNDS = true;
 const ENABLE_REACTION_BOUNDS = false;
@@ -23,6 +25,7 @@ const EXPRESSION_BOUNDS_SAMPLE_FRAMES = 36;
 const MOTION_BOUNDS_SAMPLE_FRAMES = 180;
 const BUBBLE_GAP = 8;
 const BUBBLE_RESERVED_HEIGHT = 54;
+const CALIBRATION_PANEL_OFFSET = 116;
 const DOG_BOUNDS_MARGIN = { left: 0.08, right: 0.32, top: 0.03, bottom: 0.03 };
 const BOUNDS_FOCUS_DISTANCE = 9999;
 const BOUNDS_FOCUS_POINTS = [
@@ -109,8 +112,11 @@ let reactionResetTimer = 0;
 let reactionQueue: ReactionState[] = [];
 let lastReactionKey = "";
 let activeBoundsKey = "normal";
-let boundsCalibrationQueue = Promise.resolve();
-const boundsCalibrationInFlight = new Set<string>();
+let manualCalibration: ManualCalibrationState | null = null;
+let manualCalibrationFrame = 0;
+let manualPointer: { x: number; y: number; moved: boolean } | null = null;
+let currentWindowLogicalSize: { width: number; height: number } | null = null;
+let calibrationLayoutActive = false;
 
 type ReactionState = { kind: "normal" } | CompanionReaction;
 let reactionState: ReactionState = { kind: "normal" };
@@ -122,6 +128,31 @@ interface VisibleBounds {
   bottom: number;
   width: number;
   height: number;
+}
+
+interface CalibrationTask {
+  key: string;
+  label: string;
+  reaction: ReactionState;
+}
+
+interface CalibrationCandidate {
+  key: string;
+  label: string;
+  bounds: ModelBounds;
+}
+
+interface ManualCalibrationState {
+  modelPath: string;
+  displayName: string;
+  tasks: CalibrationTask[];
+  index: number;
+  boundsSet: ModelBoundsSet;
+  currentVisible: VisibleBounds | null;
+  candidates: CalibrationCandidate[];
+  inheritCandidateIndex: number;
+  started: boolean;
+  sampling: boolean;
 }
 
 const modelBoundsCache: Record<string, ModelBoundsSet> = {};
@@ -201,7 +232,24 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
     <div id="bubble" class="bubble">今天也来翻旧信。</div>
     <section id="pet" class="pet" aria-label="桌宠" role="button" tabindex="0">
       <canvas id="live2dCanvas" class="live2d-canvas"></canvas>
+      <div id="candidateBoundsOverlay" class="candidate-bounds-overlay hidden"></div>
+      <div id="boundsOverlay" class="bounds-overlay hidden"></div>
       <div id="fallback" class="fallback hidden">Huohuo</div>
+    </section>
+    <section id="calibrationPanel" class="calibration-panel hidden" aria-label="Live2D 入库">
+      <div class="calibration-copy">
+        <strong id="calibrationTitle">桌宠入库</strong>
+        <span id="calibrationStatus">准备开始</span>
+        <span id="calibrationTaskList" class="calibration-task-list"></span>
+      </div>
+      <div id="calibrationCandidateList" class="calibration-candidate-list hidden" aria-label="选择继承候选框"></div>
+      <div class="calibration-actions">
+        <button id="calibrationStart" type="button">开始</button>
+        <button id="calibrationConfirm" type="button">确认</button>
+        <button id="calibrationInherit" type="button">继承选中</button>
+        <button id="calibrationRescan" type="button">重扫</button>
+        <button id="calibrationLater" type="button">稍后</button>
+      </div>
     </section>
     <section id="notebookSearch" class="notebook-search hidden" aria-label="搜索 Folia">
       <input id="notebookSearchInput" type="search" placeholder="搜索 Folia page" autocomplete="off" />
@@ -214,7 +262,19 @@ const shell = document.querySelector<HTMLElement>(".companion-shell")!;
 const pet = document.querySelector<HTMLElement>("#pet")!;
 const bubble = document.querySelector<HTMLElement>("#bubble")!;
 const canvas = document.querySelector<HTMLCanvasElement>("#live2dCanvas")!;
+const candidateBoundsOverlay = document.querySelector<HTMLElement>("#candidateBoundsOverlay")!;
+const boundsOverlay = document.querySelector<HTMLElement>("#boundsOverlay")!;
 const fallback = document.querySelector<HTMLElement>("#fallback")!;
+const calibrationPanel = document.querySelector<HTMLElement>("#calibrationPanel")!;
+const calibrationTitle = document.querySelector<HTMLElement>("#calibrationTitle")!;
+const calibrationStatus = document.querySelector<HTMLElement>("#calibrationStatus")!;
+const calibrationTaskList = document.querySelector<HTMLElement>("#calibrationTaskList")!;
+const calibrationCandidateList = document.querySelector<HTMLElement>("#calibrationCandidateList")!;
+const calibrationStart = document.querySelector<HTMLButtonElement>("#calibrationStart")!;
+const calibrationConfirm = document.querySelector<HTMLButtonElement>("#calibrationConfirm")!;
+const calibrationInherit = document.querySelector<HTMLButtonElement>("#calibrationInherit")!;
+const calibrationRescan = document.querySelector<HTMLButtonElement>("#calibrationRescan")!;
+const calibrationLater = document.querySelector<HTMLButtonElement>("#calibrationLater")!;
 const notebookSearch = document.querySelector<HTMLElement>("#notebookSearch")!;
 const notebookSearchInput = document.querySelector<HTMLInputElement>("#notebookSearchInput")!;
 const notebookSearchResults = document.querySelector<HTMLElement>("#notebookSearchResults")!;
@@ -255,14 +315,10 @@ async function init() {
   if (settings.position) {
     await appWindow.setPosition(new PhysicalPosition(settings.position.x, settings.position.y));
   }
-  const selected = settings.selectedModelPath || models[0]?.modelPath || null;
+  const selected = startupModelPath();
   if (selected) {
     await applyScale(scaleForModel(selected));
     await loadModel(selected, true);
-    scheduleMissingBoundsCalibration(selected, "current");
-    models.forEach((model) => {
-      if (model.modelPath !== selected) scheduleMissingBoundsCalibration(model.modelPath, "startup");
-    });
   } else {
     fallback.classList.remove("hidden");
     canvas.classList.add("hidden");
@@ -308,11 +364,12 @@ function speak(text: string) {
 async function applyScale(scale: number) {
   const normalized = clampScale(scale);
   settings.scale = normalized;
-  const baseWidth = currentModelBaseWidth();
+  const baseWidth = currentModelWindowWidth();
+  const baseHeight = currentModelWindowHeight();
   const bounds = currentModelBounds();
-  const trim = cropTrimForSize(baseWidth * normalized, BASE_HEIGHT * normalized, bounds);
+  const trim = cropTrimForSize(baseWidth * normalized, baseHeight * normalized, bounds);
   const width = Math.max(80, baseWidth * normalized - trim.left - trim.right);
-  const height = Math.max(140, BASE_HEIGHT * normalized - trim.top - trim.bottom) + BUBBLE_RESERVED_HEIGHT;
+  const height = Math.max(140, baseHeight * normalized - trim.top - trim.bottom) + BUBBLE_RESERVED_HEIGHT;
   const deltaLeft = Math.round(trim.left - appliedCropTrim.left);
   const deltaTop = Math.round(trim.top - appliedCropTrim.top);
   if (deltaLeft || deltaTop) {
@@ -325,6 +382,7 @@ async function applyScale(scale: number) {
   }
   appliedCropTrim = { left: trim.left, top: trim.top };
   await appWindow.setSize(new LogicalSize(width, height));
+  if (!calibrationLayoutActive) currentWindowLogicalSize = { width, height };
   currentVisibleBounds = visibleBoundsForCurrentWindow();
   window.requestAnimationFrame(refreshLayout);
 }
@@ -337,8 +395,22 @@ function scaleForModel(modelPath = settings.selectedModelPath || models[0]?.mode
   return settings.modelScales?.[modelPath] ?? 1;
 }
 
+function startupModelPath() {
+  const saved = settings.selectedModelPath || "";
+  if (saved && models.some((model) => model.modelPath === saved)) return saved;
+  return models[0]?.modelPath || null;
+}
+
 function currentModelBaseWidth() {
   return modelBaseWidth(live2dModel);
+}
+
+function currentModelWindowWidth() {
+  return modelWindowWidth(live2dModel);
+}
+
+function currentModelWindowHeight() {
+  return modelWindowHeight();
 }
 
 function modelBaseWidth(model: Live2DModel | null) {
@@ -352,6 +424,14 @@ function modelBaseWidth(model: Live2DModel | null) {
     || 420;
   const ratio = width > 0 && height > 0 ? width / height : 0.5;
   return Math.max(MIN_BASE_WIDTH, Math.min(MAX_BASE_WIDTH, BASE_HEIGHT * ratio + WIDTH_PADDING));
+}
+
+function modelWindowWidth(model: Live2DModel | null) {
+  return modelBaseWidth(model) + MODEL_OVERSCAN.left + MODEL_OVERSCAN.right;
+}
+
+function modelWindowHeight() {
+  return BASE_HEIGHT + MODEL_OVERSCAN.top + MODEL_OVERSCAN.bottom;
 }
 
 function currentModelBounds(boundsKey = activeBoundsKey) {
@@ -545,10 +625,10 @@ function cropTrimForSize(windowWidth: number, windowHeight: number, bounds: Mode
   const maxHorizontalTrim = windowWidth * MAX_WINDOW_CROP_RATIO;
   const maxVerticalTrim = windowHeight * MAX_WINDOW_CROP_RATIO;
   return {
-    left: Math.min(maxHorizontalTrim, Math.max(0, bounds.left - CROP_PADDING) * xScale),
-    top: Math.min(maxVerticalTrim, Math.max(0, bounds.top - CROP_PADDING) * yScale),
-    right: Math.min(maxHorizontalTrim, Math.max(0, bounds.width - bounds.right - CROP_PADDING) * xScale),
-    bottom: Math.min(maxVerticalTrim, Math.max(0, bounds.height - bounds.bottom - CROP_PADDING) * yScale),
+    left: Math.min(maxHorizontalTrim, Math.max(0, bounds.left - CROP_PADDING.left) * xScale),
+    top: Math.min(maxVerticalTrim, Math.max(0, bounds.top - CROP_PADDING.top) * yScale),
+    right: Math.min(maxHorizontalTrim, Math.max(0, bounds.width - bounds.right - CROP_PADDING.right) * xScale),
+    bottom: Math.min(maxVerticalTrim, Math.max(0, bounds.height - bounds.bottom - CROP_PADDING.bottom) * yScale),
   };
 }
 
@@ -558,8 +638,8 @@ function visibleBoundsForCurrentWindow(): VisibleBounds | null {
   const rect = pet.getBoundingClientRect();
   if (rect.width < 20 || rect.height < 20) return null;
   const trim = cropTrimForSize(
-    currentModelBaseWidth() * scaleForModel(),
-    BASE_HEIGHT * scaleForModel() + BUBBLE_RESERVED_HEIGHT,
+    currentModelWindowWidth() * scaleForModel(),
+    currentModelWindowHeight() * scaleForModel() + BUBBLE_RESERVED_HEIGHT,
     bounds,
   );
   const fullWidth = rect.width + trim.left + trim.right;
@@ -644,7 +724,7 @@ async function loadModel(modelPath: string, allowFallback: boolean): Promise<boo
     await applyScale(scaleForModel(modelPath));
     refreshLayout();
     await saveCurrentSettings();
-    scheduleMissingBoundsCalibration(modelPath, "load");
+    promptManualCalibrationIfNeeded(modelPath);
     logEvent(`loadModel success: ${modelPath}`);
     return true;
   } catch (error) {
@@ -667,29 +747,452 @@ async function loadModel(modelPath: string, allowFallback: boolean): Promise<boo
   }
 }
 
-function scheduleMissingBoundsCalibration(modelPath: string, reason: string) {
-  if (!modelPath || modelBoundsCache[modelPath] || boundsCalibrationInFlight.has(modelPath)) return;
-  boundsCalibrationInFlight.add(modelPath);
-  boundsCalibrationQueue = boundsCalibrationQueue
-    .catch(() => undefined)
-    .then(async () => {
-      try {
-        if (modelBoundsCache[modelPath]) return;
-        logEvent(`alpha bounds queued (${reason}): ${modelPath}`);
-        const { url: source } = await invoke<ModelUrlResult>("model_asset_url", { modelPath });
-        const reactions = await invoke<CompanionReaction[]>("model_reactions", { modelPath });
-        const calibrationReactions = reactions.filter((reaction) => reaction.kind === "motion" || reaction.kind === "expression");
-        const bounds = await calibrateModelBounds(modelPath, source, calibrationReactions);
-        if (!bounds) return;
-        await invoke("write_local_bounds", { modelPath, boundsJson: JSON.stringify(bounds) });
-        modelBoundsCache[modelPath] = bounds;
-        logEvent(`alpha bounds cached locally: ${modelPath}`);
-      } catch (error) {
-        logEvent(`alpha bounds local calibration failed ${modelPath}: ${String(error)}`);
-      } finally {
-        boundsCalibrationInFlight.delete(modelPath);
-      }
+function promptManualCalibrationIfNeeded(modelPath: string) {
+  showManualCalibration(modelPath, false);
+}
+
+function forceManualCalibrationForCurrentModel() {
+  const modelPath = settings.selectedModelPath;
+  if (!modelPath) {
+    speak("还没有当前桌宠。");
+    return;
+  }
+  showManualCalibration(modelPath, true);
+}
+
+function showManualCalibration(modelPath: string, force: boolean) {
+  if (!modelPath || (!force && modelBoundsCache[modelPath])) {
+    hideManualCalibration();
+    return;
+  }
+  const model = models.find((candidate) => candidate.modelPath === modelPath);
+  const tasks = buildCalibrationTasks(modelReactions);
+  logEvent(`manual bounds onboarding tasks ${modelPath}: ${tasks.map((task) => task.key).join(", ")}`);
+  manualCalibration = {
+    modelPath,
+    displayName: model?.displayName || "Live2D",
+    tasks,
+    index: 0,
+    boundsSet: { reactions: {}, measuredAt: Date.now() },
+    currentVisible: null,
+    candidates: [],
+    inheritCandidateIndex: -1,
+    started: false,
+    sampling: false,
+  };
+  calibrationPanel.classList.remove("hidden");
+  boundsOverlay.classList.add("hidden");
+  candidateBoundsOverlay.classList.add("hidden");
+  shell.classList.add("is-calibrating");
+  updateCalibrationPanel();
+  renderCalibrationCandidates();
+  void enterCalibrationLayout();
+}
+
+function buildCalibrationTasks(reactions: CompanionReaction[]) {
+  const tasks: CalibrationTask[] = [{ key: "normal", label: "normal", reaction: { kind: "normal" } }];
+  const seen = new Set(["normal"]);
+  reactions
+    .filter((reaction) => !(reaction.kind === "motion" && (reaction.group || reaction.name).toLowerCase() === "idle"))
+    .filter((reaction) => reaction.kind === "motion" || reaction.kind === "expression")
+    .forEach((reaction) => {
+      const key = reactionKey(reaction);
+      if (seen.has(key)) return;
+      seen.add(key);
+      tasks.push({
+        key,
+        label: key,
+        reaction,
+      });
     });
+  return tasks;
+}
+
+function currentCalibrationTask() {
+  return manualCalibration?.tasks[manualCalibration.index] || null;
+}
+
+function updateCalibrationPanel() {
+  const state = manualCalibration;
+  if (!state) return;
+  const task = currentCalibrationTask();
+  calibrationTitle.textContent = state.started ? `入库 ${state.displayName}` : `发现新桌宠：${state.displayName}`;
+  calibrationStatus.textContent = state.started && task
+    ? `${state.index + 1}/${state.tasks.length} ${task.label} · 移动鼠标扫一圈`
+    : `共 ${state.tasks.length} 个可变项`;
+  calibrationTaskList.textContent = state.tasks.map((candidate, index) => {
+    const prefix = index === state.index ? ">" : "";
+    return `${prefix}${candidate.label}`;
+  }).join(" · ");
+  calibrationStart.classList.toggle("hidden", state.started);
+  calibrationConfirm.classList.toggle("hidden", !state.started);
+  calibrationInherit.classList.toggle("hidden", !state.started);
+  calibrationRescan.classList.toggle("hidden", !state.started);
+  const hasCandidates = state.started && state.candidates.length > 0;
+  calibrationCandidateList.classList.toggle("hidden", !hasCandidates);
+  calibrationInherit.disabled = !hasCandidates || state.index === 0;
+
+  if (!hasCandidates) {
+    calibrationCandidateList.innerHTML = "";
+    state.inheritCandidateIndex = -1;
+    renderCalibrationCandidates();
+    return;
+  }
+
+  if (state.inheritCandidateIndex < 0 || state.inheritCandidateIndex >= state.candidates.length) {
+    state.inheritCandidateIndex = state.candidates.length - 1;
+  }
+  calibrationCandidateList.innerHTML = state.candidates
+    .map((candidate, index) => {
+      const selected = index === state.inheritCandidateIndex;
+      return `
+        <button class="calibration-candidate ${selected ? "is-selected" : ""}" type="button" data-candidate-index="${index}">
+          <span class="calibration-candidate-swatch" style="background:${candidateColor(index)}"></span>
+          <span>${index + 1}. ${escapeHtml(candidate.label)}</span>
+        </button>
+      `;
+    })
+    .join("");
+  renderCalibrationCandidates();
+}
+
+async function startManualCalibration() {
+  const state = manualCalibration;
+  if (!state || state.started) return;
+  state.started = true;
+  logEvent(`manual bounds onboarding start: ${state.modelPath} tasks=${state.tasks.length}`);
+  await startCurrentCalibrationTask();
+}
+
+async function startCurrentCalibrationTask() {
+  const state = manualCalibration;
+  const task = currentCalibrationTask();
+  if (!state || !task) return;
+  stopManualSampling();
+  state.currentVisible = null;
+  drawCalibrationBounds(null);
+  updateCalibrationPanel();
+  await applyCalibrationTask(task);
+  state.sampling = true;
+  startManualSamplingLoop();
+}
+
+async function applyCalibrationTask(task: CalibrationTask) {
+  if (!live2dModel) return;
+  window.clearTimeout(reactionResetTimer);
+  if (task.reaction.kind === "normal") {
+    await resetModelReaction();
+    return;
+  }
+  await resetModelReaction();
+  if (task.reaction.kind === "expression") {
+    const expression = task.reaction.expression || task.reaction.name;
+    void live2dModel.expression?.(expression);
+  }
+  if (task.reaction.kind === "motion") {
+    const group = task.reaction.group || task.reaction.name;
+    void live2dModel.motion?.(group);
+  }
+}
+
+function startManualSamplingLoop() {
+  window.cancelAnimationFrame(manualCalibrationFrame);
+  const sample = () => {
+    const state = manualCalibration;
+    if (!state?.sampling || !pixiApp) return;
+    const bounds = measureAlphaBounds(pixiApp);
+    if (bounds) {
+      state.currentVisible = mergeVisibleBounds(state.currentVisible, bounds);
+      drawCalibrationBounds(state.currentVisible);
+    }
+    manualCalibrationFrame = window.requestAnimationFrame(sample);
+  };
+  manualCalibrationFrame = window.requestAnimationFrame(sample);
+}
+
+function stopManualSampling() {
+  window.cancelAnimationFrame(manualCalibrationFrame);
+  if (manualCalibration) manualCalibration.sampling = false;
+}
+
+function drawCalibrationBounds(bounds: VisibleBounds | null) {
+  if (!bounds || !manualCalibration) {
+    boundsOverlay.classList.add("hidden");
+    renderCalibrationCandidates();
+    return;
+  }
+  const expanded = manualDisplayVisibleBounds(bounds);
+  boundsOverlay.style.left = `${Math.round(expanded.left)}px`;
+  boundsOverlay.style.top = `${Math.round(expanded.top)}px`;
+  boundsOverlay.style.width = `${Math.round(expanded.right - expanded.left)}px`;
+  boundsOverlay.style.height = `${Math.round(expanded.bottom - expanded.top)}px`;
+  boundsOverlay.classList.remove("hidden");
+  renderCalibrationCandidates();
+}
+
+async function confirmCurrentCalibrationTask() {
+  const state = manualCalibration;
+  const task = currentCalibrationTask();
+  if (!state || !task || !state.started) return;
+  const bounds = manualVisibleToModelBounds(state.currentVisible);
+  if (!bounds) {
+    speak("还没有捕捉到可见区域。");
+    return;
+  }
+  await saveCalibrationTaskBounds(task, bounds, true);
+}
+
+async function inheritCurrentCalibrationTask() {
+  const state = manualCalibration;
+  const task = currentCalibrationTask();
+  if (!state || !task || !state.started || state.index === 0) return;
+  const candidate = state.candidates[state.inheritCandidateIndex];
+  if (!candidate) return;
+  await saveCalibrationTaskBounds(task, candidate.bounds, false);
+}
+
+async function saveCalibrationTaskBounds(task: CalibrationTask, bounds: ModelBounds, addToCandidates: boolean) {
+  const state = manualCalibration;
+  if (!state) return;
+  state.boundsSet.normal = mergeModelBounds(state.boundsSet.normal, bounds);
+  if (task.key === "normal") {
+    state.boundsSet.normal = mergeModelBounds(state.boundsSet.normal, bounds);
+  } else {
+    state.boundsSet.reactions ||= {};
+    state.boundsSet.reactions[task.key] = bounds;
+  }
+  state.boundsSet.measuredAt = Date.now();
+  if (addToCandidates) addCalibrationCandidate(state, { key: task.key, label: task.label, bounds });
+  await writeManualCalibrationBounds(state);
+  state.index += 1;
+  if (state.index >= state.tasks.length) {
+    await finishManualCalibration();
+    return;
+  }
+  await startCurrentCalibrationTask();
+}
+
+function addCalibrationCandidate(state: ManualCalibrationState, candidate: CalibrationCandidate) {
+  const existingIndex = state.candidates.findIndex((existing) => areBoundsEquivalent(existing.bounds, candidate.bounds));
+  if (existingIndex >= 0) {
+    state.inheritCandidateIndex = existingIndex;
+    return;
+  }
+  state.candidates.push(candidate);
+  state.inheritCandidateIndex = state.candidates.length - 1;
+}
+
+function areBoundsEquivalent(left: ModelBounds, right: ModelBounds) {
+  return Math.abs(left.left - right.left) <= 1
+    && Math.abs(left.top - right.top) <= 1
+    && Math.abs(left.right - right.right) <= 1
+    && Math.abs(left.bottom - right.bottom) <= 1
+    && Math.abs(left.width - right.width) <= 1
+    && Math.abs(left.height - right.height) <= 1;
+}
+
+function mergeModelBounds(previous: ModelBounds | undefined, next: ModelBounds): ModelBounds {
+  if (!previous) return next;
+  return {
+    left: Math.min(previous.left, next.left),
+    top: Math.min(previous.top, next.top),
+    right: Math.max(previous.right, next.right),
+    bottom: Math.max(previous.bottom, next.bottom),
+    width: next.width,
+    height: next.height,
+    measuredAt: Date.now(),
+  };
+}
+
+function renderCalibrationCandidates() {
+  candidateBoundsOverlay.innerHTML = "";
+  const state = manualCalibration;
+  if (!state?.started || !state.candidates.length) {
+    candidateBoundsOverlay.classList.add("hidden");
+    return;
+  }
+  const index = state.inheritCandidateIndex;
+  const candidate = state.candidates[index];
+  if (!candidate) {
+    candidateBoundsOverlay.classList.add("hidden");
+    return;
+  }
+  const element = document.createElement("div");
+  element.className = "candidate-bound is-selected";
+  const color = candidateColor(index);
+  element.style.borderColor = color;
+  element.style.backgroundColor = candidateBackground(index, true);
+  element.title = candidate.label;
+  const visible = modelBoundsToCurrentVisible(candidate.bounds);
+  if (!visible) {
+    candidateBoundsOverlay.classList.add("hidden");
+    return;
+  }
+  element.style.left = `${Math.round(visible.left)}px`;
+  element.style.top = `${Math.round(visible.top)}px`;
+  element.style.width = `${Math.round(visible.right - visible.left)}px`;
+  element.style.height = `${Math.round(visible.bottom - visible.top)}px`;
+  candidateBoundsOverlay.appendChild(element);
+  candidateBoundsOverlay.classList.remove("hidden");
+}
+
+function candidateColor(index: number) {
+  const colors = ["#c77a2b", "#2f8e79", "#4d76b8", "#a05faf", "#8b9a32", "#c24f65"];
+  return colors[index % colors.length];
+}
+
+function candidateBackground(index: number, selected: boolean) {
+  const backgrounds = [
+    selected ? "rgba(199, 122, 43, 0.12)" : "rgba(199, 122, 43, 0.06)",
+    selected ? "rgba(47, 142, 121, 0.12)" : "rgba(47, 142, 121, 0.06)",
+    selected ? "rgba(77, 118, 184, 0.12)" : "rgba(77, 118, 184, 0.06)",
+    selected ? "rgba(160, 95, 175, 0.12)" : "rgba(160, 95, 175, 0.06)",
+    selected ? "rgba(139, 154, 50, 0.12)" : "rgba(139, 154, 50, 0.06)",
+    selected ? "rgba(194, 79, 101, 0.12)" : "rgba(194, 79, 101, 0.06)",
+  ];
+  return backgrounds[index % backgrounds.length];
+}
+
+function modelBoundsToCurrentVisible(bounds: ModelBounds): VisibleBounds | null {
+  const rect = pet.getBoundingClientRect();
+  if (rect.width < 20 || rect.height < 20) return null;
+  const xScale = rect.width / bounds.width;
+  const yScale = rect.height / bounds.height;
+  return {
+    left: bounds.left * xScale,
+    top: bounds.top * yScale,
+    right: bounds.right * xScale,
+    bottom: bounds.bottom * yScale,
+    width: rect.width,
+    height: rect.height,
+  };
+}
+
+function manualVisibleToModelBounds(bounds: VisibleBounds | null) {
+  if (!bounds || !manualCalibration) return null;
+  const paddedBounds = manualDisplayVisibleBounds(bounds);
+  const baseWidth = Math.max(1, currentModelWindowWidth() - PET_HORIZONTAL_INSET);
+  const baseHeight = Math.max(1, currentModelWindowHeight() - PET_VERTICAL_INSET);
+  const xScale = baseWidth / paddedBounds.width;
+  const yScale = baseHeight / paddedBounds.height;
+  return visibleToModelBounds(manualCalibration.modelPath, {
+    left: paddedBounds.left * xScale,
+    top: paddedBounds.top * yScale,
+    right: paddedBounds.right * xScale,
+    bottom: paddedBounds.bottom * yScale,
+    width: baseWidth,
+    height: baseHeight,
+  });
+}
+
+function manualDisplayVisibleBounds(bounds: VisibleBounds): VisibleBounds {
+  if (!manualCalibration) return bounds;
+  return expandVisibleBoundsForModel(
+    manualCalibration.modelPath,
+    expandVisibleBoundsByPixels(bounds, MANUAL_BOUNDS_PADDING),
+  );
+}
+
+function expandVisibleBoundsByPixels(bounds: VisibleBounds, padding: { left: number; top: number; right: number; bottom: number }): VisibleBounds {
+  return {
+    left: Math.max(0, bounds.left - padding.left),
+    top: Math.max(0, bounds.top - padding.top),
+    right: Math.min(bounds.width, bounds.right + padding.right),
+    bottom: Math.min(bounds.height, bounds.bottom + padding.bottom),
+    width: bounds.width,
+    height: bounds.height,
+  };
+}
+
+async function writeManualCalibrationBounds(state: ManualCalibrationState) {
+  if (!state.boundsSet.normal) return;
+  await invoke("write_local_bounds", { modelPath: state.modelPath, boundsJson: JSON.stringify(state.boundsSet) });
+  modelBoundsCache[state.modelPath] = normalizeBoundsSet(state.boundsSet) || state.boundsSet;
+  logEvent(`manual bounds saved: ${state.modelPath}`);
+}
+
+async function finishManualCalibration() {
+  const state = manualCalibration;
+  if (!state) return;
+  stopManualSampling();
+  if (state.boundsSet.normal) await writeManualCalibrationBounds(state);
+  hideManualCalibration();
+  await resetModelReaction(true);
+  window.setTimeout(() => void applyScale(scaleForModel()), 120);
+  speak("入库完成。");
+}
+
+async function rescanCurrentCalibrationTask() {
+  const state = manualCalibration;
+  if (!state?.started) return;
+  await startCurrentCalibrationTask();
+}
+
+async function closeManualCalibration(savePartial = false) {
+  const state = manualCalibration;
+  if (savePartial && state?.boundsSet.normal) {
+    await writeManualCalibrationBounds(state);
+  }
+  stopManualSampling();
+  hideManualCalibration();
+  await resetModelReaction(true);
+  speak("已稍后再入库。");
+}
+
+function hideManualCalibration() {
+  stopManualSampling();
+  manualCalibration = null;
+  manualPointer = null;
+  calibrationPanel.classList.add("hidden");
+  boundsOverlay.classList.add("hidden");
+  candidateBoundsOverlay.classList.add("hidden");
+  candidateBoundsOverlay.innerHTML = "";
+  shell.classList.remove("is-calibrating");
+  void exitCalibrationLayout();
+}
+
+async function enterCalibrationLayout() {
+  if (calibrationLayoutActive || !currentWindowLogicalSize) {
+    window.requestAnimationFrame(refreshLayout);
+    return;
+  }
+  calibrationLayoutActive = true;
+  try {
+    const position = await appWindow.outerPosition();
+    await appWindow.setPosition(new PhysicalPosition(position.x, Math.max(0, position.y - CALIBRATION_PANEL_OFFSET)));
+    await appWindow.setSize(new LogicalSize(
+      currentWindowLogicalSize.width,
+      currentWindowLogicalSize.height + CALIBRATION_PANEL_OFFSET,
+    ));
+  } catch (error) {
+    logEvent(`enter calibration layout failed: ${String(error)}`);
+  }
+  window.requestAnimationFrame(refreshLayout);
+}
+
+async function exitCalibrationLayout() {
+  if (!calibrationLayoutActive || !currentWindowLogicalSize) {
+    window.requestAnimationFrame(refreshLayout);
+    return;
+  }
+  calibrationLayoutActive = false;
+  try {
+    const position = await appWindow.outerPosition();
+    await appWindow.setPosition(new PhysicalPosition(position.x, position.y + CALIBRATION_PANEL_OFFSET));
+    await appWindow.setSize(new LogicalSize(currentWindowLogicalSize.width, currentWindowLogicalSize.height));
+  } catch (error) {
+    logEvent(`exit calibration layout failed: ${String(error)}`);
+  }
+  window.requestAnimationFrame(refreshLayout);
+}
+
+function focusLive2DFromPointer(clientX: number, clientY: number) {
+  if (!live2dModel) return;
+  const rect = pet.getBoundingClientRect();
+  const radius = Math.max(1, Math.min(rect.width, rect.height) * 0.5);
+  const x = Math.max(-1, Math.min(1, (clientX - rect.left - rect.width * 0.5) / radius));
+  const y = Math.max(-1, Math.min(1, (clientY - rect.top - rect.height * 0.5) / radius));
+  live2dModel.focus?.(x * BOUNDS_FOCUS_DISTANCE, y * BOUNDS_FOCUS_DISTANCE);
 }
 
 function refreshLayout() {
@@ -700,17 +1203,23 @@ function resizeModel() {
   if (!pixiApp || !live2dModel) return;
   const rect = pet.getBoundingClientRect();
   pixiApp.renderer.resize(rect.width, rect.height);
-  const baseWidth = currentModelBaseWidth() * scaleForModel();
-  const baseHeight = BASE_HEIGHT * scaleForModel() + BUBBLE_RESERVED_HEIGHT;
+  const baseWidth = currentModelWindowWidth() * scaleForModel();
+  const baseHeight = currentModelWindowHeight() * scaleForModel() + BUBBLE_RESERVED_HEIGHT;
   const trim = cropTrimForSize(baseWidth, baseHeight, currentModelBounds());
   const fullWidth = rect.width + trim.left + trim.right;
   const fullHeight = rect.height + trim.top + trim.bottom;
+  const overscanScaleX = fullWidth / Math.max(1, currentModelWindowWidth() * scaleForModel());
+  const overscanScaleY = fullHeight / Math.max(1, currentModelWindowHeight() * scaleForModel());
+  const contentLeft = MODEL_OVERSCAN.left * scaleForModel() * overscanScaleX;
+  const contentTop = MODEL_OVERSCAN.top * scaleForModel() * overscanScaleY;
+  const contentWidth = Math.max(1, fullWidth - (MODEL_OVERSCAN.left + MODEL_OVERSCAN.right) * scaleForModel() * overscanScaleX);
+  const contentHeight = Math.max(1, fullHeight - (MODEL_OVERSCAN.top + MODEL_OVERSCAN.bottom) * scaleForModel() * overscanScaleY);
   const modelWidth = live2dModel.internalModel?.originalWidth || live2dModel.internalModel?.width || live2dModel.width || 3000;
   const modelHeight = live2dModel.internalModel?.originalHeight || live2dModel.internalModel?.height || live2dModel.height || 5000;
-  const scale = Math.min((fullWidth * 0.98) / modelWidth, (fullHeight * 0.98) / modelHeight);
+  const scale = Math.min((contentWidth * 0.98) / modelWidth, (contentHeight * 0.98) / modelHeight);
   live2dModel.anchor?.set(0.5, 0.5);
   live2dModel.scale.set(scale);
-  live2dModel.position.set(fullWidth * 0.5 - trim.left, fullHeight * 0.5 - trim.top);
+  live2dModel.position.set(contentLeft + contentWidth * 0.5 - trim.left, contentTop + contentHeight * 0.5 - trim.top);
   currentVisibleBounds = visibleBoundsForCurrentWindow();
   window.requestAnimationFrame(positionBubble);
 }
@@ -828,8 +1337,12 @@ async function sampleModelIdleFrame() {
 
 function layoutModelForBounds(app: PixiApplication, model: Live2DModel) {
   const baseWidth = modelBaseWidth(model);
-  const width = Math.max(1, baseWidth - PET_HORIZONTAL_INSET);
-  const height = Math.max(1, BASE_HEIGHT - PET_VERTICAL_INSET);
+  const width = Math.max(1, modelWindowWidth(model) - PET_HORIZONTAL_INSET);
+  const height = Math.max(1, modelWindowHeight() - PET_VERTICAL_INSET);
+  const contentLeft = MODEL_OVERSCAN.left;
+  const contentTop = MODEL_OVERSCAN.top;
+  const contentWidth = Math.max(1, baseWidth);
+  const contentHeight = Math.max(1, BASE_HEIGHT);
   const rendererView = (app.renderer as unknown as { view?: HTMLCanvasElement }).view;
   if (rendererView) {
     rendererView.style.width = `${width}px`;
@@ -838,10 +1351,10 @@ function layoutModelForBounds(app: PixiApplication, model: Live2DModel) {
   app.renderer.resize(width, height);
   const modelWidth = model.internalModel?.originalWidth || model.internalModel?.width || model.width || 3000;
   const modelHeight = model.internalModel?.originalHeight || model.internalModel?.height || model.height || 5000;
-  const scale = Math.min((width * 0.98) / modelWidth, (height * 0.98) / modelHeight);
+  const scale = Math.min((contentWidth * 0.98) / modelWidth, (contentHeight * 0.98) / modelHeight);
   model.anchor?.set(0.5, 0.5);
   model.scale.set(scale);
-  model.position.set(width * 0.5, height * 0.5);
+  model.position.set(contentLeft + contentWidth * 0.5, contentTop + contentHeight * 0.5);
 }
 
 function renderApp(app: PixiApplication) {
@@ -1119,10 +1632,47 @@ async function resetPosition() {
   }
 }
 
+calibrationStart.addEventListener("click", () => {
+  void startManualCalibration();
+});
+
+calibrationCandidateList.addEventListener("click", (event) => {
+  const state = manualCalibration;
+  if (!state) return;
+  const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>("[data-candidate-index]");
+  if (!button) return;
+  const index = Number.parseInt(button.dataset.candidateIndex || "", 10);
+  if (!Number.isFinite(index)) return;
+  state.inheritCandidateIndex = Math.max(0, Math.min(state.candidates.length - 1, index));
+  updateCalibrationPanel();
+});
+
+calibrationConfirm.addEventListener("click", () => {
+  void confirmCurrentCalibrationTask();
+});
+
+calibrationInherit.addEventListener("click", () => {
+  void inheritCurrentCalibrationTask();
+});
+
+calibrationRescan.addEventListener("click", () => {
+  void rescanCurrentCalibrationTask();
+});
+
+calibrationLater.addEventListener("click", () => {
+  void closeManualCalibration(true);
+});
+
 pet.addEventListener("pointerdown", (event) => {
   if (event.button !== 0) return;
   pet.focus({ preventScroll: true });
   hideNotebookSearch();
+  if (manualCalibration?.started) {
+    event.preventDefault();
+    manualPointer = { x: event.clientX, y: event.clientY, moved: false };
+    focusLive2DFromPointer(event.clientX, event.clientY);
+    return;
+  }
   if (event.altKey) {
     event.preventDefault();
     resizeDrag = {
@@ -1137,6 +1687,14 @@ pet.addEventListener("pointerdown", (event) => {
 });
 
 pet.addEventListener("pointermove", (event) => {
+  if (manualCalibration?.started) {
+    if (manualPointer) {
+      const moved = Math.abs(event.clientX - manualPointer.x) + Math.abs(event.clientY - manualPointer.y);
+      if (moved > 7) manualPointer.moved = true;
+    }
+    focusLive2DFromPointer(event.clientX, event.clientY);
+    return;
+  }
   if (resizeDrag) {
     const delta = (event.clientY - resizeDrag.startY) / 180;
     void setCurrentModelScale(resizeDrag.startScale + delta, false);
@@ -1162,6 +1720,10 @@ async function finishResizeDrag(event: PointerEvent) {
 }
 
 pet.addEventListener("pointerup", async (event) => {
+  if (manualCalibration?.started) {
+    manualPointer = null;
+    return;
+  }
   if (await finishResizeDrag(event)) return;
   const wasMoved = dragState?.moved;
   dragState = null;
@@ -1178,6 +1740,7 @@ pet.addEventListener("pointerup", async (event) => {
 });
 
 pet.addEventListener("pointercancel", async (event) => {
+  manualPointer = null;
   await finishResizeDrag(event);
   dragState = null;
 });
@@ -1206,10 +1769,39 @@ document.addEventListener("pointerdown", (event) => {
   }
 });
 
+document.addEventListener("pointermove", (event) => {
+  if (!manualCalibration?.started) return;
+  const target = event.target as Node;
+  if (calibrationPanel.contains(target)) return;
+  focusLive2DFromPointer(event.clientX, event.clientY);
+});
+
 document.addEventListener("keydown", async (event) => {
   const target = event.target as HTMLElement | null;
   const isTyping = Boolean(target?.closest("input, textarea, select, [contenteditable='true']"));
   const key = event.key.toLowerCase();
+  if (manualCalibration?.started) {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      await confirmCurrentCalibrationTask();
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      await closeManualCalibration(true);
+      return;
+    }
+    if (event.altKey && (event.key.startsWith("Arrow") || key === "f" || key === "i" || key === "b")) {
+      event.preventDefault();
+      return;
+    }
+  }
+  if (event.altKey && !isTyping && (event.code === "KeyB" || key === "b")) {
+    event.preventDefault();
+    if (event.repeat) return;
+    forceManualCalibrationForCurrentModel();
+    return;
+  }
   if (event.altKey && (event.code === "KeyF" || key === "f")) {
     event.preventDefault();
     showNotebookSearch();
