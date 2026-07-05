@@ -19,6 +19,7 @@ const MAX_WINDOW_CROP_RATIO = 0.22;
 const CROP_ALPHA_THRESHOLD = 8;
 const ENABLE_RUNTIME_BOUNDS = true;
 const BOUNDS_SETTLE_FRAMES = 8;
+const EXPRESSION_BOUNDS_SAMPLE_FRAMES = 36;
 const MOTION_BOUNDS_SAMPLE_FRAMES = 180;
 const BUBBLE_GAP = 8;
 const BUBBLE_RESERVED_HEIGHT = 54;
@@ -35,7 +36,6 @@ const BOUNDS_FOCUS_POINTS = [
     };
   }),
 ];
-const MOTION_BOUNDS_FRAMES_PER_FOCUS = Math.max(12, Math.ceil(MOTION_BOUNDS_SAMPLE_FRAMES / BOUNDS_FOCUS_POINTS.length));
 
 interface WindowPosition {
   x: number;
@@ -473,12 +473,20 @@ async function sampleModelBounds(app: PixiApplication, model: Live2DModel, frame
   return merged;
 }
 
-async function sampleAllFocusBounds(app: PixiApplication, model: Live2DModel, framesPerFocus = BOUNDS_SETTLE_FRAMES) {
+async function sampleAllFocusBounds(
+  app: PixiApplication,
+  model: Live2DModel,
+  applyState: (() => void | Promise<void>) | null = null,
+  framesPerFocus = BOUNDS_SETTLE_FRAMES,
+) {
   let merged: VisibleBounds | null = null;
-  for (const point of BOUNDS_FOCUS_POINTS) {
+  for (const [index, point] of BOUNDS_FOCUS_POINTS.entries()) {
+    await resetCalibrationModel(model);
     model.focus?.(point.x, point.y);
+    await applyState?.();
     const bounds = await sampleModelBounds(app, model, framesPerFocus);
     if (bounds) merged = mergeVisibleBounds(merged, bounds);
+    logEvent(`alpha bounds focus sampled ${index + 1}/${BOUNDS_FOCUS_POINTS.length}`);
   }
   return merged;
 }
@@ -670,7 +678,7 @@ async function calibrateModelBounds(
     calibrationApp.stage.addChild(calibrationModel);
     layoutModelForBounds(calibrationApp, calibrationModel);
 
-    const normalVisible = await sampleAllFocusBounds(calibrationApp, calibrationModel);
+    const normalVisible = await sampleAllFocusBounds(calibrationApp, calibrationModel, null, EXPRESSION_BOUNDS_SAMPLE_FRAMES);
     const normal = visibleToModelBounds(modelPath, normalVisible);
     if (normal) {
       nextBoundsSet.normal = normal;
@@ -680,16 +688,27 @@ async function calibrateModelBounds(
     for (const reaction of reactions) {
       const key = reactionKey(reaction);
       if (nextBoundsSet.reactions?.[key]) continue;
-      await resetCalibrationModel(calibrationModel);
       let reactionVisible: VisibleBounds | null = null;
       if (reaction.kind === "expression") {
         const expression = reaction.expression || reaction.name;
-        void calibrationModel.expression?.(expression);
-        reactionVisible = await sampleAllFocusBounds(calibrationApp, calibrationModel, BOUNDS_SETTLE_FRAMES);
+        reactionVisible = await sampleAllFocusBounds(
+          calibrationApp,
+          calibrationModel,
+          () => {
+            void calibrationModel?.expression?.(expression);
+          },
+          EXPRESSION_BOUNDS_SAMPLE_FRAMES,
+        );
       } else if (reaction.kind === "motion") {
         const group = reaction.group || reaction.name;
-        void calibrationModel.motion?.(group);
-        reactionVisible = await sampleAllFocusBounds(calibrationApp, calibrationModel, MOTION_BOUNDS_FRAMES_PER_FOCUS);
+        reactionVisible = await sampleAllFocusBounds(
+          calibrationApp,
+          calibrationModel,
+          () => {
+            void calibrationModel?.motion?.(group);
+          },
+          MOTION_BOUNDS_SAMPLE_FRAMES,
+        );
       }
       const bounds = visibleToModelBounds(modelPath, reactionVisible);
       if (bounds) {
