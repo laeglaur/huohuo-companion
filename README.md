@@ -2,7 +2,9 @@
 
 huohuo 是一个 macOS Live2D 桌宠。它会把你自己下载的 Live2D 模型放在桌面上，支持切换角色、调整每个角色的大小，并提供可选的 Archive、Folia、iCity 快捷入口。
 
-<video src="assets/demo.mp4" controls width="360"></video>
+![huohuo demo](assets/demo.gif)
+
+[查看完整演示视频](assets/demo.mp4)
 
 > 本仓库不包含也不再分发任何 Live2D 模型素材。用户需要自行下载模型，并遵守每个模型作者的授权条款。
 
