@@ -34,9 +34,25 @@ export interface Live2DModel {
     originalHeight?: number;
     width?: number;
     height?: number;
+    coreModel?: {
+      getParameterCount?: () => number;
+      getParameterDefaultValue?: (index: number) => number;
+      setParameterValueByIndex?: (index: number, value: number, weight?: number) => void;
+      saveParameters?: () => void;
+    };
+    motionManager?: {
+      expressionManager?: {
+        stopAllExpressions?: () => void;
+      };
+      _stopAllMotions?: () => void;
+    };
+    settings?: {
+      expressions?: Array<{ Name?: string; name?: string; File?: string; file?: string }>;
+      motions?: Record<string, Array<{ File?: string; file?: string }>>;
+    };
   };
-  expression?: () => void;
-  motion?: (group?: string) => void;
+  expression?: (name?: string) => void | Promise<boolean>;
+  motion?: (group?: string, index?: number) => void | Promise<unknown>;
   focus?: (x: number, y: number) => void;
   destroy?: () => void;
 }

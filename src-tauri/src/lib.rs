@@ -2,7 +2,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -15,8 +15,10 @@ use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 const ARCHIVE_APP_DIR: &str = "/Users/laeglaur/Documents/code/record/archive_app";
 const HUUOHUO_DIR: &str = "/Users/laeglaur/Documents/code/record/huohuo";
 const ANIME_DIR: &str = "/Users/laeglaur/Documents/code/record/anime";
-const NOTEBOOK_APP: &str = "/Users/laeglaur/Documents/code/notebook/src-tauri/target/release/bundle/macos/folia.app";
-const NOTEBOOK_APP_DATA_DIR: &str = "/Users/laeglaur/Library/Application Support/com.laeglaur.notebook";
+const NOTEBOOK_APP: &str =
+    "/Users/laeglaur/Documents/code/notebook/src-tauri/target/release/bundle/macos/folia.app";
+const NOTEBOOK_APP_DATA_DIR: &str =
+    "/Users/laeglaur/Library/Application Support/com.laeglaur.notebook";
 const NOTEBOOK_DATABASE_FILE: &str = "notebook.sqlite3";
 const DEFAULT_MODEL_PATH: &str = "/Users/laeglaur/Documents/code/record/huohuo/huohuo.model3.json";
 const SETTINGS_FILE: &str = "settings.json";
@@ -73,6 +75,15 @@ struct ArchiveLaunchResult {
 struct ModelUrlResult {
     url: String,
     port: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompanionReaction {
+    kind: String,
+    name: String,
+    group: Option<String>,
+    expression: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,8 +154,8 @@ fn load_settings(app: AppHandle) -> Result<CompanionSettings, String> {
     if !path.exists() {
         return Ok(default_settings());
     }
-    let text = fs::read_to_string(&path)
-        .map_err(|error| format!("Could not read settings: {error}"))?;
+    let text =
+        fs::read_to_string(&path).map_err(|error| format!("Could not read settings: {error}"))?;
     let mut settings: CompanionSettings = serde_json::from_str(&text)
         .map_err(|error| format!("Could not parse settings: {error}"))?;
     if settings.scale <= 0.0 {
@@ -172,6 +183,15 @@ fn discover_models() -> Result<Vec<CompanionModel>, String> {
         Path::new(ANIME_DIR),
         Path::new(DEFAULT_MODEL_PATH),
     ))
+}
+
+#[tauri::command]
+fn model_reactions(model_path: String) -> Result<Vec<CompanionReaction>, String> {
+    let path = PathBuf::from(model_path);
+    let model_dir = path
+        .parent()
+        .ok_or_else(|| "Model file has no parent directory.".to_string())?;
+    Ok(discover_reactions_in_dir(model_dir))
 }
 
 #[tauri::command]
@@ -212,23 +232,46 @@ fn model_asset_url(
     let port = if let Some(port) = existing_port {
         port
     } else {
-        let port = choose_port(9865)?;
         append_log(
             &app,
-            &format!("starting model server: dir={} port={port}", model_dir.display()),
+            &format!(
+                "starting model server: dir={} port=auto",
+                model_dir.display()
+            ),
         );
-        let child = Command::new("python3")
+        let mut child = Command::new("python3")
             .arg("-c")
             .arg(cors_static_server_script())
-            .arg(port.to_string())
+            .arg("0")
             .current_dir(model_dir)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .map_err(|error| {
                 append_log(&app, &format!("model server spawn failed: {error}"));
                 format!("Could not start model file server: {error}")
             })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            let _ = child.kill();
+            "Could not read model server port.".to_string()
+        })?;
+        let mut reader = BufReader::new(stdout);
+        let mut port_line = String::new();
+        reader.read_line(&mut port_line).map_err(|error| {
+            let _ = child.kill();
+            format!("Could not read model server port: {error}")
+        })?;
+        let port = port_line.trim().parse::<u16>().map_err(|error| {
+            let _ = child.kill();
+            format!("Model server returned invalid port: {error}")
+        })?;
+        append_log(
+            &app,
+            &format!(
+                "started model server: dir={} port={port}",
+                model_dir.display()
+            ),
+        );
         {
             let mut guard = state
                 .0
@@ -427,7 +470,10 @@ fn icity_compact_script() -> String {
 }
 
 #[tauri::command]
-fn search_notebook_pages(query: String, limit: Option<u32>) -> Result<Vec<NotebookPageSearchResult>, String> {
+fn search_notebook_pages(
+    query: String,
+    limit: Option<u32>,
+) -> Result<Vec<NotebookPageSearchResult>, String> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
@@ -504,7 +550,10 @@ fn open_notebook_card(app: AppHandle, page_id: String) -> Result<NotebookCardLau
 }
 
 #[tauri::command]
-fn launch_archive(app: AppHandle, state: tauri::State<ArchiveProcess>) -> Result<ArchiveLaunchResult, String> {
+fn launch_archive(
+    app: AppHandle,
+    state: tauri::State<ArchiveProcess>,
+) -> Result<ArchiveLaunchResult, String> {
     launch_archive_from_app(&app, &state)
 }
 
@@ -517,8 +566,14 @@ fn launch_archive_from_app(
         .lock()
         .map_err(|_| "Archive process lock is poisoned.".to_string())?;
     if let Some(child) = guard.as_mut() {
-        if child.try_wait().map_err(|error| format!("Could not inspect Archive process: {error}"))?.is_none() {
-            let port = load_settings(app.clone())?.last_archive_port.unwrap_or(8765);
+        if child
+            .try_wait()
+            .map_err(|error| format!("Could not inspect Archive process: {error}"))?
+            .is_none()
+        {
+            let port = load_settings(app.clone())?
+                .last_archive_port
+                .unwrap_or(8765);
             let url = archive_url(port);
             open_archive_window(app, &url)?;
             return Ok(ArchiveLaunchResult { url, port });
@@ -573,7 +628,10 @@ fn register_global_shortcuts(app: &tauri::App) -> Result<(), Box<dyn std::error:
                 append_log(app, "global shortcut option+right: launch archive");
                 let state = app.state::<ArchiveProcess>();
                 if let Err(error) = launch_archive_from_app(app, &state) {
-                    append_log(app, &format!("global shortcut launch archive failed: {error}"));
+                    append_log(
+                        app,
+                        &format!("global shortcut launch archive failed: {error}"),
+                    );
                 }
             })
             .build(),
@@ -586,7 +644,10 @@ fn register_global_shortcuts(app: &tauri::App) -> Result<(), Box<dyn std::error:
 fn reset_position(app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("companion") {
         window
-            .set_position(tauri::Position::Physical(tauri::PhysicalPosition { x: 60, y: 160 }))
+            .set_position(tauri::Position::Physical(tauri::PhysicalPosition {
+                x: 60,
+                y: 160,
+            }))
             .map_err(|error| format!("Could not reset window position: {error}"))?;
     }
     let mut settings = load_settings(app.clone())?;
@@ -654,8 +715,12 @@ fn request_file_stem() -> String {
 fn cors_static_server_script() -> &'static str {
     r#"
 import http.server
+import json
+import os
 import socketserver
 import sys
+import urllib.parse
+from pathlib import Path
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
@@ -669,8 +734,118 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_response(204)
         self.end_headers()
 
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.endswith(".model3.json"):
+            path = Path(self.translate_path(parsed.path))
+            if path.exists() and path.is_file():
+                try:
+                    payload = self.augmented_model_settings(path).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                except Exception as error:
+                    print(f"model settings augmentation failed: {error}", file=sys.stderr)
+        super().do_GET()
+
+    def augmented_model_settings(self, path):
+        with path.open("r", encoding="utf-8") as file:
+            settings = json.load(file)
+        references = settings.setdefault("FileReferences", {})
+        root = Path(os.getcwd())
+        vtube = self.load_vtube_settings(root)
+        hotkeys = vtube.get("Hotkeys", []) if isinstance(vtube, dict) else []
+
+        if not references.get("Expressions"):
+            expressions = self.expression_definitions(root, hotkeys)
+            if expressions:
+                references["Expressions"] = expressions
+
+        if not references.get("Motions"):
+            motions = self.motion_definitions(root, hotkeys)
+            if motions:
+                references["Motions"] = motions
+
+        return json.dumps(settings, ensure_ascii=False, separators=(",", ":"))
+
+    def load_vtube_settings(self, root):
+        for vtube_file in sorted(root.glob("*.vtube.json"), key=lambda item: item.name.lower()):
+            try:
+                with vtube_file.open("r", encoding="utf-8") as file:
+                    return json.load(file)
+            except Exception:
+                return {}
+        return {}
+
+    def relative_model_file(self, root, file_name, suffix):
+        if not file_name or not file_name.endswith(suffix):
+            return None
+        direct = root / file_name
+        if direct.exists() and direct.is_file():
+            return direct.relative_to(root).as_posix()
+        matches = sorted(root.rglob(file_name), key=lambda item: item.as_posix().lower())
+        for match in matches:
+            relative_path = match.relative_to(root)
+            if not any(part.startswith(".") for part in relative_path.parts):
+                return relative_path.as_posix()
+        return None
+
+    def expression_definitions(self, root, hotkeys):
+        expressions = []
+        seen = set()
+        for hotkey in hotkeys:
+            if hotkey.get("Action") != "ToggleExpression":
+                continue
+            relative = self.relative_model_file(root, hotkey.get("File", ""), ".exp3.json")
+            if not relative or relative in seen:
+                continue
+            seen.add(relative)
+            name = hotkey.get("Name") or Path(relative).name[:-len(".exp3.json")]
+            expressions.append({"Name": name, "File": relative})
+
+        if expressions:
+            return expressions
+
+        for expression_file in sorted(root.rglob("*.exp3.json"), key=lambda item: item.as_posix().lower()):
+            relative_path = expression_file.relative_to(root)
+            if any(part.startswith(".") for part in relative_path.parts):
+                continue
+            expressions.append({
+                "Name": expression_file.name[:-len(".exp3.json")],
+                "File": relative_path.as_posix(),
+            })
+        return expressions
+
+    def motion_definitions(self, root, hotkeys):
+        motions = {}
+        seen = set()
+        for hotkey in hotkeys:
+            if hotkey.get("Action") != "TriggerAnimation":
+                continue
+            relative = self.relative_model_file(root, hotkey.get("File", ""), ".motion3.json")
+            if not relative or relative in seen:
+                continue
+            seen.add(relative)
+            group = Path(relative).name[:-len(".motion3.json")]
+            motions.setdefault(group, []).append({"File": relative})
+
+        if motions:
+            return motions
+
+        fallback = []
+        for motion_file in sorted(root.rglob("*.motion3.json"), key=lambda item: item.as_posix().lower()):
+            relative_path = motion_file.relative_to(root)
+            if any(part.startswith(".") for part in relative_path.parts):
+                continue
+            fallback.append({"File": relative_path.as_posix()})
+        return {"TapBody": fallback} if fallback else {}
+
 socketserver.ThreadingTCPServer.allow_reuse_address = True
 with socketserver.ThreadingTCPServer(("127.0.0.1", int(sys.argv[1])), Handler) as httpd:
+    print(httpd.server_address[1], flush=True)
     httpd.serve_forever()
 "#
 }
@@ -712,21 +887,287 @@ fn wait_for_http(url: &str, timeout: Duration) -> Result<(), String> {
     Err("Archive service did not respond in time.".to_string())
 }
 
-fn discover_models_in_paths(default_dir: &Path, anime_dir: &Path, default_model: &Path) -> Vec<CompanionModel> {
-    let mut models = Vec::new();
-    collect_model_files(default_dir, "default", default_model, &mut models);
-    collect_model_files(anime_dir, "anime", default_model, &mut models);
+fn discover_reactions_in_dir(root: &Path) -> Vec<CompanionReaction> {
+    let hotkey_reactions = discover_vtube_hotkey_reactions(root);
+    if !hotkey_reactions.is_empty() {
+        return dedup_reactions(hotkey_reactions);
+    }
+
+    let mut reactions = Vec::new();
+    for file in collect_files_with_suffix(root, ".motion3.json") {
+        let name = model_asset_stem(&file, ".motion3.json");
+        reactions.push(CompanionReaction {
+            kind: "motion".to_string(),
+            name: name.clone(),
+            group: Some(name),
+            expression: None,
+        });
+    }
+    for file in collect_files_with_suffix(root, ".exp3.json") {
+        let name = model_asset_stem(&file, ".exp3.json");
+        reactions.push(CompanionReaction {
+            kind: "expression".to_string(),
+            name: name.clone(),
+            group: None,
+            expression: Some(name),
+        });
+    }
+    dedup_reactions(reactions)
+}
+
+fn discover_vtube_hotkey_reactions(root: &Path) -> Vec<CompanionReaction> {
+    let Some(vtube) = read_first_vtube_settings(root) else {
+        return Vec::new();
+    };
+    let Some(hotkeys) = vtube.get("Hotkeys").and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut reactions = Vec::new();
+    for hotkey in hotkeys {
+        let action = hotkey
+            .get("Action")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let file = hotkey
+            .get("File")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let hotkey_name = hotkey
+            .get("Name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        match action {
+            "TriggerAnimation" => {
+                if relative_model_file(root, file, ".motion3.json").is_some() {
+                    let group = file.trim_end_matches(".motion3.json").to_string();
+                    reactions.push(CompanionReaction {
+                        kind: "motion".to_string(),
+                        name: if hotkey_name.is_empty() {
+                            group.clone()
+                        } else {
+                            hotkey_name.to_string()
+                        },
+                        group: Some(group),
+                        expression: None,
+                    });
+                }
+            }
+            "ToggleExpression" => {
+                if let Some(expression_file) = relative_model_file(root, file, ".exp3.json") {
+                    let expression = model_asset_stem(&expression_file, ".exp3.json");
+                    let name = if hotkey_name.is_empty() {
+                        expression.clone()
+                    } else {
+                        hotkey_name.to_string()
+                    };
+                    reactions.push(CompanionReaction {
+                        kind: "expression".to_string(),
+                        name,
+                        group: None,
+                        expression: Some(expression),
+                    });
+                }
+            }
+            "RemoveAllExpressions" => {
+                reactions.push(CompanionReaction {
+                    kind: "clear".to_string(),
+                    name: "clear expressions".to_string(),
+                    group: None,
+                    expression: None,
+                });
+            }
+            _ => {}
+        }
+    }
+    reactions
+}
+
+fn read_first_vtube_settings(root: &Path) -> Option<serde_json::Value> {
+    let mut entries = fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .map(|name| name.ends_with(".vtube.json"))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    let path = entries.first()?;
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+}
+
+fn relative_model_file(root: &Path, file_name: &str, suffix: &str) -> Option<PathBuf> {
+    if file_name.is_empty() || !file_name.ends_with(suffix) {
+        return None;
+    }
+    let direct = root.join(file_name);
+    if direct.is_file() {
+        return Some(PathBuf::from(file_name));
+    }
+    collect_files_with_suffix(root, suffix)
+        .into_iter()
+        .find(|path| path.file_name().and_then(|value| value.to_str()) == Some(file_name))
+}
+
+fn collect_files_with_suffix(root: &Path, suffix: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_files_with_suffix_into(root, root, suffix, &mut files);
+    files.sort();
+    files
+}
+
+fn collect_files_with_suffix_into(
+    root: &Path,
+    path: &Path,
+    suffix: &str,
+    files: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|name| name.starts_with('.'))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if path.is_dir() {
+            collect_files_with_suffix_into(root, &path, suffix, files);
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|name| name.ends_with(suffix))
+            .unwrap_or(false)
+        {
+            files.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
+        }
+    }
+}
+
+fn model_asset_stem(path: &Path, suffix: &str) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .trim_end_matches(suffix)
+        .to_string()
+}
+
+fn dedup_reactions(reactions: Vec<CompanionReaction>) -> Vec<CompanionReaction> {
+    let mut result = Vec::new();
+    for reaction in reactions {
+        let exists = result.iter().any(|existing: &CompanionReaction| {
+            existing.kind == reaction.kind
+                && existing.name == reaction.name
+                && existing.group == reaction.group
+                && existing.expression == reaction.expression
+        });
+        if !exists {
+            result.push(reaction);
+        }
+    }
+    result
+}
+
+fn discover_models_in_paths(
+    default_dir: &Path,
+    anime_dir: &Path,
+    default_model: &Path,
+) -> Vec<CompanionModel> {
+    let mut collected = Vec::new();
+    collect_model_files(default_dir, "default", default_model, &mut collected);
+    collect_model_files(anime_dir, "anime", default_model, &mut collected);
+
+    let mut by_folder: HashMap<String, CompanionModel> = HashMap::new();
+    for model in collected {
+        by_folder
+            .entry(model.folder.clone())
+            .and_modify(|existing| {
+                if model_preference_score(&model) > model_preference_score(existing) {
+                    *existing = model.clone();
+                }
+            })
+            .or_insert(model);
+    }
+
+    let mut models = by_folder.into_values().collect::<Vec<_>>();
     models.sort_by(|a, b| {
         b.is_default
             .cmp(&a.is_default)
-            .then_with(|| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()))
+            .then_with(|| {
+                a.display_name
+                    .to_lowercase()
+                    .cmp(&b.display_name.to_lowercase())
+            })
             .then_with(|| a.model_path.cmp(&b.model_path))
     });
     models.dedup_by(|a, b| a.model_path == b.model_path);
     models
 }
 
-fn collect_model_files(root: &Path, source_group: &str, default_model: &Path, models: &mut Vec<CompanionModel>) {
+fn model_preference_score(model: &CompanionModel) -> i32 {
+    if model.is_default {
+        return 10_000;
+    }
+
+    let display_name = model.display_name.to_lowercase();
+    let normalized_name = normalize_model_name(&display_name);
+    let folder_name = Path::new(&model.folder)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let normalized_folder = normalize_model_name(&folder_name);
+    let mut score = normalized_name.len().min(40) as i32;
+
+    if normalized_name == normalized_folder {
+        score += 80;
+    } else if !normalized_folder.is_empty() && normalized_name.contains(&normalized_folder) {
+        score += 40;
+    } else if let Some(token) = normalized_folder
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .find(|token| token.len() > 2)
+    {
+        if normalized_name.contains(token) {
+            score += 20;
+        }
+    }
+
+    if normalized_name == "model" {
+        score -= 100;
+    }
+    if normalized_name.starts_with("modelv") || normalized_name.ends_with("v1") {
+        score -= 80;
+    }
+    if normalized_name.contains("copy") || normalized_name.contains("backup") {
+        score -= 50;
+    }
+
+    score
+}
+
+fn normalize_model_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn collect_model_files(
+    root: &Path,
+    source_group: &str,
+    default_model: &Path,
+    models: &mut Vec<CompanionModel>,
+) {
     if !root.exists() {
         return;
     }
@@ -800,6 +1241,7 @@ pub fn run() {
             save_settings,
             log_event,
             discover_models,
+            model_reactions,
             model_asset_url,
             open_notebook,
             open_icity_login,
@@ -849,6 +1291,57 @@ mod tests {
         assert!(models[0].is_default);
         assert_eq!(models[0].display_name, "huohuo");
         assert!(models.iter().any(|model| model.display_name == "dog"));
+    }
+
+    #[test]
+    fn keeps_one_preferred_model_per_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let default_dir = temp.path().join("huohuo");
+        let anime_dir = temp.path().join("anime");
+        let nagito_dir = anime_dir.join("Nagito vtuber model");
+        fs::create_dir_all(&default_dir).unwrap();
+        fs::create_dir_all(&nagito_dir).unwrap();
+        let default_model = default_dir.join("huohuo.model3.json");
+        fs::write(&default_model, "{}").unwrap();
+        fs::write(nagito_dir.join("NagitoModel.model3.json"), "{}").unwrap();
+        fs::write(nagito_dir.join("modelv1.model3.json"), "{}").unwrap();
+
+        let models = discover_models_in_paths(&default_dir, &anime_dir, &default_model);
+
+        assert_eq!(models.len(), 2);
+        assert!(models
+            .iter()
+            .any(|model| model.display_name == "NagitoModel"));
+        assert!(!models.iter().any(|model| model.display_name == "modelv1"));
+    }
+
+    #[test]
+    fn vtube_expression_reaction_uses_model_expression_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let model_dir = temp.path().join("cat");
+        let expression_dir = model_dir.join("expressions");
+        fs::create_dir_all(&expression_dir).unwrap();
+        fs::write(expression_dir.join("kowai.exp3.json"), "{}").unwrap();
+        fs::write(
+            model_dir.join("cat.vtube.json"),
+            r#"{
+                "Hotkeys": [
+                    {
+                        "Name": "怖い顔",
+                        "Action": "ToggleExpression",
+                        "File": "kowai.exp3.json"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let reactions = discover_reactions_in_dir(&model_dir);
+
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].kind, "expression");
+        assert_eq!(reactions[0].name, "怖い顔");
+        assert_eq!(reactions[0].expression.as_deref(), Some("kowai"));
     }
 
     #[test]
