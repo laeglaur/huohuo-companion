@@ -15,8 +15,9 @@ const PET_VERTICAL_INSET = 10;
 const CROP_PADDING = 6;
 const MAX_WINDOW_CROP_RATIO = 0.22;
 const CROP_ALPHA_THRESHOLD = 8;
-const MODEL_BOUNDS_STORAGE_KEY = "huohuo.modelBounds.precomputed.v1";
+const MODEL_BOUNDS_STORAGE_KEY = "huohuo.modelBounds.reactions.v1";
 const BOUNDS_SETTLE_FRAMES = 8;
+const MOTION_BOUNDS_SAMPLE_FRAMES = 180;
 const BUBBLE_GAP = 8;
 const BUBBLE_RESERVED_HEIGHT = 54;
 const DOG_MODEL_PATH = "/Users/laeglaur/Documents/code/record/anime/Mimi/dog.model3.json";
@@ -32,6 +33,7 @@ const BOUNDS_FOCUS_POINTS = [
     };
   }),
 ];
+const MOTION_BOUNDS_FRAMES_PER_FOCUS = Math.max(12, Math.ceil(MOTION_BOUNDS_SAMPLE_FRAMES / BOUNDS_FOCUS_POINTS.length));
 
 interface WindowPosition {
   x: number;
@@ -100,6 +102,9 @@ let currentVisibleBounds: VisibleBounds | null = null;
 let reactionResetTimer = 0;
 let reactionQueue: ReactionState[] = [];
 let lastReactionKey = "";
+let activeBoundsKey = "normal";
+let boundsCalibrationPromise: Promise<void> | null = null;
+let pendingBoundsCalibration: { modelPath: string; source: string; reactions: CompanionReaction[] } | null = null;
 
 type ReactionState = { kind: "normal" } | CompanionReaction;
 let reactionState: ReactionState = { kind: "normal" };
@@ -114,6 +119,12 @@ interface ModelBounds {
   measuredAt: number;
 }
 
+interface ModelBoundsSet {
+  normal?: ModelBounds;
+  reactions?: Record<string, ModelBounds>;
+  measuredAt?: number;
+}
+
 interface VisibleBounds {
   left: number;
   top: number;
@@ -123,17 +134,18 @@ interface VisibleBounds {
   height: number;
 }
 
-const modelBoundsCache: Record<string, ModelBounds> = {};
-const PRECOMPUTED_MODEL_BOUNDS: Record<string, ModelBounds> = {};
+const modelBoundsCache: Record<string, ModelBoundsSet> = {};
+const PRECOMPUTED_MODEL_BOUNDS: Record<string, ModelBoundsSet> = {};
 
 function loadStoredModelBounds() {
   try {
     const stored = {
       ...PRECOMPUTED_MODEL_BOUNDS,
-      ...JSON.parse(localStorage.getItem(MODEL_BOUNDS_STORAGE_KEY) || "{}") as Record<string, ModelBounds>,
+      ...JSON.parse(localStorage.getItem(MODEL_BOUNDS_STORAGE_KEY) || "{}") as Record<string, ModelBoundsSet | ModelBounds>,
     };
-    Object.entries(stored).forEach(([modelPath, bounds]) => {
-      if (isValidBounds(bounds)) modelBoundsCache[modelPath] = bounds;
+    Object.entries(stored).forEach(([modelPath, value]) => {
+      const boundsSet = normalizeBoundsSet(value);
+      if (boundsSet) modelBoundsCache[modelPath] = boundsSet;
     });
   } catch (error) {
     logEvent(`load stored bounds failed: ${String(error)}`);
@@ -142,6 +154,18 @@ function loadStoredModelBounds() {
 
 function saveStoredModelBounds() {
   localStorage.setItem(MODEL_BOUNDS_STORAGE_KEY, JSON.stringify(modelBoundsCache));
+}
+
+function normalizeBoundsSet(value: unknown): ModelBoundsSet | null {
+  if (isValidBounds(value)) return { normal: value, reactions: {}, measuredAt: value.measuredAt };
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as ModelBoundsSet;
+  const next: ModelBoundsSet = { reactions: {}, measuredAt: candidate.measuredAt };
+  if (isValidBounds(candidate.normal)) next.normal = candidate.normal;
+  Object.entries(candidate.reactions || {}).forEach(([key, bounds]) => {
+    if (isValidBounds(bounds)) next.reactions![key] = bounds;
+  });
+  return next.normal || Object.keys(next.reactions || {}).length ? next : null;
 }
 
 function isValidBounds(bounds: unknown): bounds is ModelBounds {
@@ -285,9 +309,24 @@ function modelBaseWidth(model: Live2DModel | null) {
   return Math.max(MIN_BASE_WIDTH, Math.min(MAX_BASE_WIDTH, BASE_HEIGHT * ratio + WIDTH_PADDING));
 }
 
-function currentModelBounds() {
+function currentModelBounds(boundsKey = activeBoundsKey) {
   const modelPath = settings.selectedModelPath || DEFAULT_MODEL_PATH;
-  return modelBoundsCache[modelPath] || null;
+  const boundsSet = modelBoundsCache[modelPath];
+  if (!boundsSet) return null;
+  if (boundsKey !== "normal") {
+    return boundsSet.reactions?.[boundsKey] || boundsSet.normal || null;
+  }
+  return boundsSet.normal || null;
+}
+
+async function setActiveBoundsKey(boundsKey: string) {
+  if (activeBoundsKey === boundsKey) {
+    currentVisibleBounds = visibleBoundsForCurrentWindow();
+    positionBubble();
+    return;
+  }
+  activeBoundsKey = boundsKey;
+  await applyScale(scaleForModel());
 }
 
 function modelExpressionNames(model: Live2DModel | null) {
@@ -345,7 +384,7 @@ function resetModelParametersToDefault() {
   coreModel?.saveParameters?.();
 }
 
-function resetModelReaction(clearQueue = false) {
+async function resetModelReaction(clearQueue = false) {
   if (!live2dModel) return;
   window.clearTimeout(reactionResetTimer);
   live2dModel.internalModel?.motionManager?._stopAllMotions?.();
@@ -357,28 +396,31 @@ function resetModelReaction(clearQueue = false) {
     reactionQueue = [];
     lastReactionKey = "";
   }
+  await setActiveBoundsKey("normal");
 }
 
-function enterMotionReaction(reaction: CompanionReaction) {
+async function enterMotionReaction(reaction: CompanionReaction) {
   if (!live2dModel) return;
   const group = reaction.group || reaction.name;
-  resetModelReaction();
+  await resetModelReaction();
   reactionState = reaction;
   lastReactionKey = reactionKey(reactionState);
   logEvent(`model reaction motion: ${reaction.name} (${group})`);
+  await setActiveBoundsKey(reactionKey(reaction));
   void live2dModel.motion?.(group);
-  reactionResetTimer = window.setTimeout(resetModelReaction, 9000);
+  reactionResetTimer = window.setTimeout(() => void resetModelReaction(), 9000);
 }
 
-function enterExpressionReaction(reaction: CompanionReaction) {
+async function enterExpressionReaction(reaction: CompanionReaction) {
   if (!live2dModel) return;
   const expression = reaction.expression || reaction.name;
-  resetModelReaction();
+  await resetModelReaction();
   reactionState = reaction;
   lastReactionKey = reactionKey(reactionState);
   logEvent(`model reaction expression: ${reaction.name} (${expression})`);
+  await setActiveBoundsKey(reactionKey(reaction));
   void live2dModel.expression?.(expression);
-  reactionResetTimer = window.setTimeout(resetModelReaction, 3200);
+  reactionResetTimer = window.setTimeout(() => void resetModelReaction(), 3200);
 }
 
 function playModelReaction() {
@@ -387,34 +429,26 @@ function playModelReaction() {
   try {
     const reaction = nextReaction();
     if (reaction?.kind === "motion") {
-      enterMotionReaction(reaction);
+      void enterMotionReaction(reaction);
       return;
     }
     if (reaction?.kind === "expression") {
-      enterExpressionReaction(reaction);
+      void enterExpressionReaction(reaction);
       return;
     }
     if (reaction?.kind === "clear") {
       logEvent(`model reaction clear: ${reaction.name}`);
-      resetModelReaction();
+      void resetModelReaction();
       return;
     }
 
-    resetModelReaction(true);
+    void resetModelReaction(true);
   } catch (error) {
     logEvent(`model reaction failed: ${String(error)}`);
   }
 }
 
-function calibrationExpressions(model: Live2DModel | null) {
-  return [undefined, ...modelExpressionNames(model)];
-}
-
-function calibrationMotionGroups(model: Live2DModel | null) {
-  return modelMotionGroups(model);
-}
-
-async function sampleModelBounds(app: PixiApplication, model: Live2DModel) {
+async function sampleModelBounds(app: PixiApplication, model: Live2DModel, frames = BOUNDS_SETTLE_FRAMES) {
   let merged: VisibleBounds | null = null;
   await new Promise<void>((resolve) => {
     let frame = 0;
@@ -424,7 +458,7 @@ async function sampleModelBounds(app: PixiApplication, model: Live2DModel) {
         merged = mergeVisibleBounds(merged, bounds);
       }
       frame += 1;
-      if (frame < BOUNDS_SETTLE_FRAMES) {
+      if (frame < frames) {
         window.requestAnimationFrame(sample);
         return;
       }
@@ -435,11 +469,11 @@ async function sampleModelBounds(app: PixiApplication, model: Live2DModel) {
   return merged;
 }
 
-async function sampleAllFocusBounds(app: PixiApplication, model: Live2DModel) {
+async function sampleAllFocusBounds(app: PixiApplication, model: Live2DModel, framesPerFocus = BOUNDS_SETTLE_FRAMES) {
   let merged: VisibleBounds | null = null;
   for (const point of BOUNDS_FOCUS_POINTS) {
     model.focus?.(point.x, point.y);
-    const bounds = await sampleModelBounds(app, model);
+    const bounds = await sampleModelBounds(app, model, framesPerFocus);
     if (bounds) merged = mergeVisibleBounds(merged, bounds);
   }
   return merged;
@@ -531,7 +565,7 @@ async function loadModel(modelPath: string, allowFallback: boolean): Promise<boo
       autoUpdate: true,
     });
 
-    resetModelReaction();
+    await resetModelReaction();
     live2dModel?.destroy?.();
     pixiApp?.destroy(false);
     pixiApp = nextApp;
@@ -549,8 +583,10 @@ async function loadModel(modelPath: string, allowFallback: boolean): Promise<boo
     }
     reactionQueue = [];
     lastReactionKey = "";
+    activeBoundsKey = "normal";
     await applyScale(scaleForModel(modelPath));
     refreshLayout();
+    scheduleBoundsCalibration(modelPath, source);
     await saveCurrentSettings();
     logEvent(`loadModel success: ${modelPath}`);
     return true;
@@ -571,6 +607,26 @@ async function loadModel(modelPath: string, allowFallback: boolean): Promise<boo
   } finally {
     isSwitchingModel = false;
   }
+}
+
+function scheduleBoundsCalibration(modelPath: string, source: string, reactions = modelReactions) {
+  const boundsSet = modelBoundsCache[modelPath];
+  const calibrationReactions = reactions.filter((reaction) => reaction.kind === "motion" || reaction.kind === "expression");
+  const needsCalibration = !boundsSet?.normal || calibrationReactions.some((reaction) => !boundsSet.reactions?.[reactionKey(reaction)]);
+  if (!needsCalibration) return;
+  logEvent(`alpha bounds scheduled ${modelPath}`);
+  if (boundsCalibrationPromise) {
+    pendingBoundsCalibration = { modelPath, source, reactions: calibrationReactions };
+    return;
+  }
+  boundsCalibrationPromise = calibrateModelBounds(modelPath, source, calibrationReactions, true)
+    .catch((error) => logEvent(`alpha bounds background failed: ${String(error)}`))
+    .finally(() => {
+      boundsCalibrationPromise = null;
+      const pending = pendingBoundsCalibration;
+      pendingBoundsCalibration = null;
+      if (pending) scheduleBoundsCalibration(pending.modelPath, pending.source, pending.reactions);
+    });
 }
 
 function refreshLayout() {
@@ -599,10 +655,12 @@ function resizeModel() {
 async function calibrateModelBounds(
   modelPath: string,
   source: string,
+  reactions: CompanionReaction[],
   applyToCurrentModel = false,
 ) {
   const previous = modelBoundsCache[modelPath];
-  if (previous) {
+  const missingReaction = reactions.some((reaction) => !previous?.reactions?.[reactionKey(reaction)]);
+  if (previous?.normal && !missingReaction) {
     if (applyToCurrentModel) {
       currentVisibleBounds = visibleBoundsForCurrentWindow();
       positionBubble();
@@ -612,6 +670,7 @@ async function calibrateModelBounds(
 
   const Live2DModel = window.PIXI?.live2d?.Live2DModel;
   if (!window.PIXI || !Live2DModel) return;
+  logEvent(`alpha bounds calibration start ${modelPath}: reactions=${reactions.length}`);
 
   const calibrationCanvas = document.createElement("canvas");
   calibrationCanvas.className = "bounds-calibration-canvas";
@@ -627,7 +686,11 @@ async function calibrateModelBounds(
   });
 
   let calibrationModel: Live2DModel | null = null;
-  let merged: VisibleBounds | null = null;
+  const nextBoundsSet: ModelBoundsSet = {
+    normal: previous?.normal,
+    reactions: { ...(previous?.reactions || {}) },
+    measuredAt: Date.now(),
+  };
   try {
     calibrationModel = await Live2DModel.from(source, {
       autoInteract: false,
@@ -636,20 +699,32 @@ async function calibrateModelBounds(
     calibrationApp.stage.addChild(calibrationModel);
     layoutModelForBounds(calibrationApp, calibrationModel);
 
-    merged = await sampleAllFocusBounds(calibrationApp, calibrationModel);
-
-    for (const expressionName of calibrationExpressions(calibrationModel).filter(Boolean)) {
-      calibrationModel.internalModel?.motionManager?.expressionManager?.stopAllExpressions?.();
-      void calibrationModel.expression?.(expressionName);
-      const bounds = await sampleAllFocusBounds(calibrationApp, calibrationModel);
-      if (bounds) merged = mergeVisibleBounds(merged, bounds);
+    const normalVisible = await sampleAllFocusBounds(calibrationApp, calibrationModel);
+    const normal = visibleToModelBounds(modelPath, normalVisible);
+    if (normal) {
+      nextBoundsSet.normal = normal;
+      logEvent(`alpha bounds ${modelPath} normal: ${JSON.stringify(normal)}`);
     }
 
-    calibrationModel.internalModel?.motionManager?.expressionManager?.stopAllExpressions?.();
-    for (const motionGroup of calibrationMotionGroups(calibrationModel)) {
-      void calibrationModel.motion?.(motionGroup);
-      const bounds = await sampleAllFocusBounds(calibrationApp, calibrationModel);
-      if (bounds) merged = mergeVisibleBounds(merged, bounds);
+    for (const reaction of reactions) {
+      const key = reactionKey(reaction);
+      if (nextBoundsSet.reactions?.[key]) continue;
+      await resetCalibrationModel(calibrationModel);
+      let reactionVisible: VisibleBounds | null = null;
+      if (reaction.kind === "expression") {
+        const expression = reaction.expression || reaction.name;
+        void calibrationModel.expression?.(expression);
+        reactionVisible = await sampleAllFocusBounds(calibrationApp, calibrationModel, BOUNDS_SETTLE_FRAMES);
+      } else if (reaction.kind === "motion") {
+        const group = reaction.group || reaction.name;
+        void calibrationModel.motion?.(group);
+        reactionVisible = await sampleAllFocusBounds(calibrationApp, calibrationModel, MOTION_BOUNDS_FRAMES_PER_FOCUS);
+      }
+      const bounds = visibleToModelBounds(modelPath, reactionVisible);
+      if (bounds) {
+        nextBoundsSet.reactions![key] = bounds;
+        logEvent(`alpha bounds ${modelPath} ${key}: ${JSON.stringify(bounds)}`);
+      }
     }
   } catch (error) {
     logEvent(`alpha bounds calibration failed: ${modelPath}: ${String(error)}`);
@@ -659,17 +734,40 @@ async function calibrateModelBounds(
     calibrationCanvas.remove();
   }
 
-  if (!merged) return;
-  const next = boundsFromVisibleBounds(expandVisibleBoundsForModel(modelPath, merged));
-  if (!next) return;
-  modelBoundsCache[modelPath] = mergeModelBounds(previous, next);
+  if (!nextBoundsSet.normal && !Object.keys(nextBoundsSet.reactions || {}).length) return;
+  modelBoundsCache[modelPath] = nextBoundsSet;
   saveStoredModelBounds();
-  logEvent(`alpha bounds ${modelPath}: ${JSON.stringify(modelBoundsCache[modelPath])}`);
+  logEvent(`alpha bounds set ${modelPath}: normal=${Boolean(nextBoundsSet.normal)} reactions=${Object.keys(nextBoundsSet.reactions || {}).length}`);
 
   if (applyToCurrentModel && settings.selectedModelPath === modelPath) {
     await applyScale(scaleForModel(modelPath));
     refreshLayout();
   }
+}
+
+function visibleToModelBounds(modelPath: string, bounds: VisibleBounds | null): ModelBounds | null {
+  if (!bounds) return null;
+  return boundsFromVisibleBounds(expandVisibleBoundsForModel(modelPath, bounds));
+}
+
+async function resetCalibrationModel(model: Live2DModel) {
+  model.internalModel?.motionManager?._stopAllMotions?.();
+  model.internalModel?.motionManager?.expressionManager?.stopAllExpressions?.();
+  const coreModel = model.internalModel?.coreModel;
+  const count = coreModel?.getParameterCount?.() || 0;
+  for (let index = 0; index < count; index += 1) {
+    const defaultValue = coreModel?.getParameterDefaultValue?.(index);
+    if (Number.isFinite(defaultValue)) {
+      coreModel?.setParameterValueByIndex?.(index, defaultValue as number, 1);
+    }
+  }
+  coreModel?.saveParameters?.();
+  model.focus?.(0, 0);
+  await sampleModelIdleFrame();
+}
+
+async function sampleModelIdleFrame() {
+  await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
 }
 
 function layoutModelForBounds(app: PixiApplication, model: Live2DModel) {
@@ -781,19 +879,6 @@ function boundsFromVisibleBounds(bounds: VisibleBounds): ModelBounds | null {
     width: bounds.width,
     height: bounds.height,
     measuredAt: Date.now(),
-  };
-}
-
-function mergeModelBounds(previous: ModelBounds | undefined, next: ModelBounds): ModelBounds {
-  if (!previous || previous.width !== next.width || previous.height !== next.height) return next;
-  return {
-    left: Math.min(previous.left, next.left),
-    top: Math.min(previous.top, next.top),
-    right: Math.max(previous.right, next.right),
-    bottom: Math.max(previous.bottom, next.bottom),
-    width: next.width,
-    height: next.height,
-    measuredAt: next.measuredAt,
   };
 }
 
