@@ -5,7 +5,6 @@ import type { Live2DModel, PixiApplication } from "./global";
 import { PRECOMPUTED_MODEL_BOUNDS } from "./modelBounds.generated";
 import type { ModelBounds, ModelBoundsSet } from "./modelBoundsTypes";
 
-const DEFAULT_MODEL_PATH = "/Users/laeglaur/Documents/code/record/huohuo/huohuo.model3.json";
 const BASE_HEIGHT = 420;
 const MIN_BASE_WIDTH = 120;
 const MAX_BASE_WIDTH = 360;
@@ -24,7 +23,6 @@ const EXPRESSION_BOUNDS_SAMPLE_FRAMES = 36;
 const MOTION_BOUNDS_SAMPLE_FRAMES = 180;
 const BUBBLE_GAP = 8;
 const BUBBLE_RESERVED_HEIGHT = 54;
-const DOG_MODEL_PATH = "/Users/laeglaur/Documents/code/record/anime/Mimi/dog.model3.json";
 const DOG_BOUNDS_MARGIN = { left: 0.08, right: 0.32, top: 0.03, bottom: 0.03 };
 const BOUNDS_FOCUS_DISTANCE = 9999;
 const BOUNDS_FOCUS_POINTS = [
@@ -65,6 +63,11 @@ interface ModelUrlResult {
   port: number;
 }
 
+interface ModelBoundsCacheEntry {
+  modelPath: string;
+  boundsJson: string;
+}
+
 interface NotebookPageSearchResult {
   pageId: string;
   notebookId: string;
@@ -81,7 +84,7 @@ interface CompanionReaction {
 
 const appWindow = getCurrentWindow();
 let settings: CompanionSettings = {
-  selectedModelPath: DEFAULT_MODEL_PATH,
+  selectedModelPath: null,
   position: null,
   scale: 1,
   modelScales: {},
@@ -106,6 +109,8 @@ let reactionResetTimer = 0;
 let reactionQueue: ReactionState[] = [];
 let lastReactionKey = "";
 let activeBoundsKey = "normal";
+let boundsCalibrationQueue = Promise.resolve();
+const boundsCalibrationInFlight = new Set<string>();
 
 type ReactionState = { kind: "normal" } | CompanionReaction;
 let reactionState: ReactionState = { kind: "normal" };
@@ -124,12 +129,34 @@ const modelBoundsCache: Record<string, ModelBoundsSet> = {};
 function loadPrecomputedModelBounds() {
   try {
     Object.entries(PRECOMPUTED_MODEL_BOUNDS).forEach(([modelPath, value]) => {
-      const boundsSet = normalizeBoundsSet(value);
-      if (boundsSet) modelBoundsCache[modelPath] = boundsSet;
+      storeModelBounds(modelPath, value, "precomputed");
     });
   } catch (error) {
     logEvent(`load precomputed bounds failed: ${String(error)}`);
   }
+}
+
+async function loadLocalModelBounds() {
+  try {
+    const entries = await invoke<ModelBoundsCacheEntry[]>("load_local_bounds");
+    entries.forEach((entry) => {
+      try {
+        storeModelBounds(entry.modelPath, JSON.parse(entry.boundsJson), "local");
+      } catch (error) {
+        logEvent(`load local bounds entry failed ${entry.modelPath}: ${String(error)}`);
+      }
+    });
+    logEvent(`local bounds loaded: ${entries.length}`);
+  } catch (error) {
+    logEvent(`load local bounds failed: ${String(error)}`);
+  }
+}
+
+function storeModelBounds(modelPath: string, value: unknown, source: string) {
+  const boundsSet = normalizeBoundsSet(value);
+  if (!boundsSet) return;
+  modelBoundsCache[modelPath] = boundsSet;
+  logEvent(`bounds cache loaded (${source}): ${modelPath}`);
 }
 
 function normalizeBoundsSet(value: unknown): ModelBoundsSet | null {
@@ -200,7 +227,7 @@ async function init() {
   } catch (error) {
     logEvent(`load_settings failed, using defaults: ${String(error)}`);
     settings = {
-      selectedModelPath: DEFAULT_MODEL_PATH,
+      selectedModelPath: null,
       position: null,
       scale: 1,
       modelScales: {},
@@ -210,6 +237,7 @@ async function init() {
   logEvent(`settings loaded: selected=${settings.selectedModelPath || ""}`);
   settings.modelScales ||= {};
   loadPrecomputedModelBounds();
+  await loadLocalModelBounds();
   if (settings.selectedModelPath && settings.modelScales[settings.selectedModelPath] == null) {
     settings.modelScales[settings.selectedModelPath] = clampScale(settings.scale);
   }
@@ -227,9 +255,19 @@ async function init() {
   if (settings.position) {
     await appWindow.setPosition(new PhysicalPosition(settings.position.x, settings.position.y));
   }
-  const selected = settings.selectedModelPath || DEFAULT_MODEL_PATH;
-  await applyScale(scaleForModel(selected));
-  await loadModel(selected, true);
+  const selected = settings.selectedModelPath || models[0]?.modelPath || null;
+  if (selected) {
+    await applyScale(scaleForModel(selected));
+    await loadModel(selected, true);
+    scheduleMissingBoundsCalibration(selected, "current");
+    models.forEach((model) => {
+      if (model.modelPath !== selected) scheduleMissingBoundsCalibration(model.modelPath, "startup");
+    });
+  } else {
+    fallback.classList.remove("hidden");
+    canvas.classList.add("hidden");
+    speak("请把 Live2D 模型放到 local/live2d。");
+  }
 }
 
 async function runBoundsCalibrationMode() {
@@ -242,12 +280,17 @@ async function runBoundsCalibrationMode() {
       const reactions = await invoke<CompanionReaction[]>("model_reactions", { modelPath: model.modelPath });
       const calibrationReactions = reactions.filter((reaction) => reaction.kind === "motion" || reaction.kind === "expression");
       const bounds = await calibrateModelBounds(model.modelPath, source, calibrationReactions);
-      if (bounds) results[model.modelPath] = bounds;
+      if (bounds) {
+        results[model.modelPath] = bounds;
+        await invoke("write_local_bounds", { modelPath: model.modelPath, boundsJson: JSON.stringify(bounds) });
+      }
     } catch (error) {
       logEvent(`alpha bounds batch model failed ${model.modelPath}: ${String(error)}`);
     }
   }
-  await invoke("write_precomputed_bounds", { boundsJson: JSON.stringify(results) });
+  if (Object.keys(results).length) {
+    await invoke("write_precomputed_bounds", { boundsJson: JSON.stringify(results) });
+  }
   logEvent(`alpha bounds batch complete: models=${Object.keys(results).length}`);
   speak("透明框采样完成。");
   await invoke("quit_app").catch(() => undefined);
@@ -290,7 +333,7 @@ function clampScale(scale: number) {
   return Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale || 1));
 }
 
-function scaleForModel(modelPath = settings.selectedModelPath || DEFAULT_MODEL_PATH) {
+function scaleForModel(modelPath = settings.selectedModelPath || models[0]?.modelPath || "") {
   return settings.modelScales?.[modelPath] ?? 1;
 }
 
@@ -313,7 +356,7 @@ function modelBaseWidth(model: Live2DModel | null) {
 
 function currentModelBounds(boundsKey = activeBoundsKey) {
   if (!ENABLE_RUNTIME_BOUNDS) return null;
-  const modelPath = settings.selectedModelPath || DEFAULT_MODEL_PATH;
+  const modelPath = settings.selectedModelPath || models[0]?.modelPath || "";
   const boundsSet = modelBoundsCache[modelPath];
   if (!boundsSet) return null;
   if (boundsKey !== "normal") {
@@ -534,7 +577,7 @@ function visibleBoundsForCurrentWindow(): VisibleBounds | null {
 }
 
 async function setCurrentModelScale(scale: number, persist = true) {
-  const modelPath = settings.selectedModelPath || DEFAULT_MODEL_PATH;
+  const modelPath = settings.selectedModelPath || models[0]?.modelPath || "";
   settings.modelScales ||= {};
   const normalized = clampScale(scale);
   settings.modelScales[modelPath] = normalized;
@@ -601,15 +644,17 @@ async function loadModel(modelPath: string, allowFallback: boolean): Promise<boo
     await applyScale(scaleForModel(modelPath));
     refreshLayout();
     await saveCurrentSettings();
+    scheduleMissingBoundsCalibration(modelPath, "load");
     logEvent(`loadModel success: ${modelPath}`);
     return true;
   } catch (error) {
     console.warn("Could not load Live2D model", error);
     logEvent(`loadModel failed: ${modelPath}: ${String(error)}`);
-    if (allowFallback && modelPath !== DEFAULT_MODEL_PATH) {
-      speak("这个模型没加载起来，先回到 Huohuo。");
+    const fallbackModel = models[0]?.modelPath || "";
+    if (allowFallback && fallbackModel && modelPath !== fallbackModel) {
+      speak("这个模型没加载起来，先回到第一个桌宠。");
       isSwitchingModel = false;
-      return loadModel(DEFAULT_MODEL_PATH, false);
+      return loadModel(fallbackModel, false);
     }
     if (!live2dModel) {
       canvas.classList.add("hidden");
@@ -620,6 +665,31 @@ async function loadModel(modelPath: string, allowFallback: boolean): Promise<boo
   } finally {
     isSwitchingModel = false;
   }
+}
+
+function scheduleMissingBoundsCalibration(modelPath: string, reason: string) {
+  if (!modelPath || modelBoundsCache[modelPath] || boundsCalibrationInFlight.has(modelPath)) return;
+  boundsCalibrationInFlight.add(modelPath);
+  boundsCalibrationQueue = boundsCalibrationQueue
+    .catch(() => undefined)
+    .then(async () => {
+      try {
+        if (modelBoundsCache[modelPath]) return;
+        logEvent(`alpha bounds queued (${reason}): ${modelPath}`);
+        const { url: source } = await invoke<ModelUrlResult>("model_asset_url", { modelPath });
+        const reactions = await invoke<CompanionReaction[]>("model_reactions", { modelPath });
+        const calibrationReactions = reactions.filter((reaction) => reaction.kind === "motion" || reaction.kind === "expression");
+        const bounds = await calibrateModelBounds(modelPath, source, calibrationReactions);
+        if (!bounds) return;
+        await invoke("write_local_bounds", { modelPath, boundsJson: JSON.stringify(bounds) });
+        modelBoundsCache[modelPath] = bounds;
+        logEvent(`alpha bounds cached locally: ${modelPath}`);
+      } catch (error) {
+        logEvent(`alpha bounds local calibration failed ${modelPath}: ${String(error)}`);
+      } finally {
+        boundsCalibrationInFlight.delete(modelPath);
+      }
+    });
 }
 
 function refreshLayout() {
@@ -844,7 +914,7 @@ function mergeVisibleBounds(previous: VisibleBounds | null, next: VisibleBounds)
 }
 
 function expandVisibleBoundsForModel(modelPath: string, bounds: VisibleBounds): VisibleBounds {
-  if (modelPath !== DOG_MODEL_PATH) return bounds;
+  if (!isDogModelPath(modelPath)) return bounds;
   return {
     left: Math.max(0, bounds.left - bounds.width * DOG_BOUNDS_MARGIN.left),
     top: Math.max(0, bounds.top - bounds.height * DOG_BOUNDS_MARGIN.top),
@@ -853,6 +923,10 @@ function expandVisibleBoundsForModel(modelPath: string, bounds: VisibleBounds): 
     width: bounds.width,
     height: bounds.height,
   };
+}
+
+function isDogModelPath(modelPath: string) {
+  return /(^|[/\\])mimi([/\\]|$)/i.test(modelPath) || /(^|[/\\])dog\.model3\.json$/i.test(modelPath);
 }
 
 function boundsFromVisibleBounds(bounds: VisibleBounds): ModelBounds | null {
@@ -981,11 +1055,10 @@ function stripHtml(value: string) {
 }
 
 function currentModelIndex() {
-  const selected = settings.selectedModelPath || DEFAULT_MODEL_PATH;
+  const selected = settings.selectedModelPath || models[0]?.modelPath || "";
   const selectedIndex = models.findIndex((model) => model.modelPath === selected);
   if (selectedIndex >= 0) return selectedIndex;
-  const defaultIndex = models.findIndex((model) => model.modelPath === DEFAULT_MODEL_PATH);
-  return defaultIndex >= 0 ? defaultIndex : 0;
+  return 0;
 }
 
 async function switchModel(direction: -1 | 1) {

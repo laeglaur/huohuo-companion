@@ -12,16 +12,9 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, LogicalSize, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
-const ARCHIVE_APP_DIR: &str = "/Users/laeglaur/Documents/code/record/archive_app";
-const HUUOHUO_DIR: &str = "/Users/laeglaur/Documents/code/record/huohuo";
-const ANIME_DIR: &str = "/Users/laeglaur/Documents/code/record/anime";
-const NOTEBOOK_APP: &str =
-    "/Users/laeglaur/Documents/code/notebook/src-tauri/target/release/bundle/macos/folia.app";
-const NOTEBOOK_APP_DATA_DIR: &str =
-    "/Users/laeglaur/Library/Application Support/com.laeglaur.notebook";
 const NOTEBOOK_DATABASE_FILE: &str = "notebook.sqlite3";
-const DEFAULT_MODEL_PATH: &str = "/Users/laeglaur/Documents/code/record/huohuo/huohuo.model3.json";
 const SETTINGS_FILE: &str = "settings.json";
+const PROJECT_ROOT: &str = env!("CARGO_MANIFEST_DIR");
 
 #[derive(Default)]
 struct ArchiveProcess(Mutex<Option<Child>>);
@@ -32,6 +25,17 @@ struct ModelServerProcess(Mutex<HashMap<PathBuf, ModelServerEntry>>);
 struct ModelServerEntry {
     port: u16,
     child: Child,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CompanionConfig {
+    #[serde(default)]
+    live2d_roots: Vec<String>,
+    default_model_path: Option<String>,
+    archive_app_dir: Option<String>,
+    folia_app_path: Option<String>,
+    folia_data_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +92,13 @@ struct CompanionReaction {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ModelBoundsCacheEntry {
+    model_path: String,
+    bounds_json: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct NotebookPageSearchResult {
     page_id: String,
     notebook_id: String,
@@ -111,6 +122,52 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
         .map_err(|error| format!("Could not resolve app data dir: {error}"))
+}
+
+fn project_root() -> PathBuf {
+    Path::new(PROJECT_ROOT)
+        .parent()
+        .unwrap_or_else(|| Path::new(PROJECT_ROOT))
+        .to_path_buf()
+}
+
+fn local_dir() -> PathBuf {
+    project_root().join("local")
+}
+
+fn expand_home_path(value: &str) -> PathBuf {
+    if value == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(value)
+}
+
+fn resolve_config_path(value: &str) -> PathBuf {
+    let path = expand_home_path(value);
+    if path.is_absolute() {
+        path
+    } else {
+        project_root().join(path)
+    }
+}
+
+fn load_companion_config() -> CompanionConfig {
+    let path = local_dir().join("config.json");
+    let mut config = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<CompanionConfig>(&text).ok())
+        .unwrap_or_default();
+    if config.live2d_roots.is_empty() {
+        config.live2d_roots.push("local/live2d".to_string());
+    }
+    config
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -140,7 +197,7 @@ fn log_event(app: AppHandle, message: String) {
 
 fn default_settings() -> CompanionSettings {
     CompanionSettings {
-        selected_model_path: Some(DEFAULT_MODEL_PATH.to_string()),
+        selected_model_path: None,
         position: None,
         scale: 1.0,
         model_scales: HashMap::new(),
@@ -201,12 +258,67 @@ fn write_precomputed_bounds(bounds_json: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn load_local_bounds() -> Result<Vec<ModelBoundsCacheEntry>, String> {
+    let bounds_dir = local_dir().join("bounds");
+    if !bounds_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(bounds_dir).map_err(|error| error.to_string())? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let parsed: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| format!("Could not parse bounds cache {}: {error}", path.display()))?;
+        let Some(model_path) = parsed.get("modelPath").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(bounds) = parsed.get("bounds") else {
+            continue;
+        };
+        entries.push(ModelBoundsCacheEntry {
+            model_path: model_path.to_string(),
+            bounds_json: serde_json::to_string(bounds).map_err(|error| error.to_string())?,
+        });
+    }
+    Ok(entries)
+}
+
+#[tauri::command]
+fn write_local_bounds(model_path: String, bounds_json: String) -> Result<(), String> {
+    let bounds_dir = local_dir().join("bounds");
+    fs::create_dir_all(&bounds_dir)
+        .map_err(|error| format!("Could not create bounds dir: {error}"))?;
+    let parsed: serde_json::Value = serde_json::from_str(&bounds_json)
+        .map_err(|error| format!("Could not parse bounds JSON: {error}"))?;
+    let payload = serde_json::json!({
+        "modelPath": model_path,
+        "bounds": parsed,
+    });
+    let path = bounds_dir.join(format!("{}.json", stable_file_stem(&model_path)));
+    let text = serde_json::to_string_pretty(&payload)
+        .map_err(|error| format!("Could not format bounds JSON: {error}"))?;
+    fs::write(path, text).map_err(|error| format!("Could not write bounds cache: {error}"))
+}
+
+fn stable_file_stem(value: &str) -> String {
+    let mut hash: u64 = 1469598103934665603;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    format!("{hash:016x}")
+}
+
+#[tauri::command]
 fn discover_models() -> Result<Vec<CompanionModel>, String> {
-    Ok(discover_models_in_paths(
-        Path::new(HUUOHUO_DIR),
-        Path::new(ANIME_DIR),
-        Path::new(DEFAULT_MODEL_PATH),
-    ))
+    let config = load_companion_config();
+    Ok(discover_models_from_config(&config))
 }
 
 #[tauri::command]
@@ -319,15 +431,50 @@ fn model_asset_url(
 
 #[tauri::command]
 fn open_notebook() -> Result<(), String> {
-    let app_path = Path::new(NOTEBOOK_APP);
-    if !app_path.exists() {
-        return Err(format!("folia.app not found at {NOTEBOOK_APP}"));
-    }
+    let app_path = find_folia_app().ok_or_else(|| {
+        "Folia is not installed or configured. Install Folia or set foliaAppPath in local/config.json."
+            .to_string()
+    })?;
     Command::new("open")
-        .arg(app_path)
+        .arg(&app_path)
         .spawn()
         .map_err(|error| format!("Could not open folia: {error}"))?;
     Ok(())
+}
+
+fn find_folia_app() -> Option<PathBuf> {
+    let config = load_companion_config();
+    if let Some(path) = config.folia_app_path.as_deref().map(resolve_config_path) {
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    [
+        "/Applications/folia.app",
+        "~/Applications/folia.app",
+        "/Applications/Folia.app",
+        "~/Applications/Folia.app",
+    ]
+    .iter()
+    .map(|path| expand_home_path(path))
+    .find(|path| path.exists())
+}
+
+fn find_folia_data_dir() -> Option<PathBuf> {
+    let config = load_companion_config();
+    if let Some(path) = config.folia_data_dir.as_deref().map(resolve_config_path) {
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    [
+        "~/Library/Application Support/com.laeglaur.folia",
+        "~/Library/Application Support/com.laeglaur.notebook",
+        "~/Library/Application Support/folia",
+    ]
+    .iter()
+    .map(|path| expand_home_path(path))
+    .find(|path| path.join(NOTEBOOK_DATABASE_FILE).exists())
 }
 
 #[tauri::command]
@@ -505,7 +652,11 @@ fn search_notebook_pages(
     let Some(fts_query) = fts_query_from_search_text(trimmed) else {
         return Ok(Vec::new());
     };
-    let db_path = Path::new(NOTEBOOK_APP_DATA_DIR).join(NOTEBOOK_DATABASE_FILE);
+    let data_dir = find_folia_data_dir().ok_or_else(|| {
+        "Folia data directory was not found. Install Folia or set foliaDataDir in local/config.json."
+            .to_string()
+    })?;
+    let db_path = data_dir.join(NOTEBOOK_DATABASE_FILE);
     if !db_path.exists() {
         return Err(format!("Folia database not found at {}", db_path.display()));
     }
@@ -549,10 +700,10 @@ fn search_notebook_pages(
 
 #[tauri::command]
 fn open_notebook_card(app: AppHandle, page_id: String) -> Result<NotebookCardLaunchResult, String> {
-    let app_path = Path::new(NOTEBOOK_APP);
-    if !app_path.exists() {
-        return Err(format!("folia.app not found at {NOTEBOOK_APP}"));
-    }
+    let app_path = find_folia_app().ok_or_else(|| {
+        "Folia is not installed or configured. Install Folia or set foliaAppPath in local/config.json."
+            .to_string()
+    })?;
     let request_dir = app_data_dir(&app)?.join("folia-card-requests");
     fs::create_dir_all(&request_dir)
         .map_err(|error| format!("Could not create folia request dir: {error}"))?;
@@ -564,7 +715,7 @@ fn open_notebook_card(app: AppHandle, page_id: String) -> Result<NotebookCardLau
         .map_err(|error| format!("Could not write folia request: {error}"))?;
     Command::new("open")
         .arg("-a")
-        .arg(app_path)
+        .arg(&app_path)
         .arg(&request_path)
         .spawn()
         .map_err(|error| format!("Could not open folia card request: {error}"))?;
@@ -585,6 +736,15 @@ fn launch_archive_from_app(
     app: &AppHandle,
     state: &tauri::State<ArchiveProcess>,
 ) -> Result<ArchiveLaunchResult, String> {
+    let archive_app_dir = load_companion_config()
+        .archive_app_dir
+        .as_deref()
+        .map(resolve_config_path)
+        .filter(|path| path.exists())
+        .ok_or_else(|| {
+            "Archive is not configured. Set archiveAppDir in local/config.json to enable Option+Right."
+                .to_string()
+        })?;
     let mut guard = state
         .0
         .lock()
@@ -612,7 +772,7 @@ fn launch_archive_from_app(
         .arg("--serve")
         .arg("--port")
         .arg(port.to_string())
-        .current_dir(ARCHIVE_APP_DIR)
+        .current_dir(&archive_app_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -1102,14 +1262,27 @@ fn dedup_reactions(reactions: Vec<CompanionReaction>) -> Vec<CompanionReaction> 
     result
 }
 
-fn discover_models_in_paths(
-    default_dir: &Path,
-    anime_dir: &Path,
-    default_model: &Path,
+fn discover_models_from_config(config: &CompanionConfig) -> Vec<CompanionModel> {
+    let default_model = config
+        .default_model_path
+        .as_deref()
+        .map(resolve_config_path);
+    let roots = config
+        .live2d_roots
+        .iter()
+        .map(|root| resolve_config_path(root))
+        .collect::<Vec<_>>();
+    discover_models_in_roots(&roots, default_model.as_deref())
+}
+
+fn discover_models_in_roots(
+    roots: &[PathBuf],
+    default_model: Option<&Path>,
 ) -> Vec<CompanionModel> {
     let mut collected = Vec::new();
-    collect_model_files(default_dir, "default", default_model, &mut collected);
-    collect_model_files(anime_dir, "anime", default_model, &mut collected);
+    for root in roots {
+        collect_model_files(root, "local", default_model, &mut collected);
+    }
 
     let mut by_folder: HashMap<String, CompanionModel> = HashMap::new();
     for model in collected {
@@ -1189,7 +1362,7 @@ fn normalize_model_name(value: &str) -> String {
 fn collect_model_files(
     root: &Path,
     source_group: &str,
-    default_model: &Path,
+    default_model: Option<&Path>,
     models: &mut Vec<CompanionModel>,
 ) {
     if !root.exists() {
@@ -1216,8 +1389,10 @@ fn collect_model_files(
         let folder = path.parent().unwrap_or(root).to_string_lossy().to_string();
         let display_name = name.trim_end_matches(".model3.json").replace('_', " ");
         let model_path = path.to_string_lossy().to_string();
-        let is_default = path == default_model;
-        let id = format!("{source_group}:{}", model_path);
+        let is_default = default_model
+            .map(|default_path| path == default_path)
+            .unwrap_or(false);
+        let id = model_id_from_path(root, &path);
         models.push(CompanionModel {
             id,
             display_name,
@@ -1227,6 +1402,13 @@ fn collect_model_files(
             is_default,
         });
     }
+}
+
+fn model_id_from_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn stop_archive_process(app: &AppHandle) {
@@ -1265,6 +1447,8 @@ pub fn run() {
             save_settings,
             is_bounds_calibration_mode,
             write_precomputed_bounds,
+            load_local_bounds,
+            write_local_bounds,
             log_event,
             discover_models,
             model_reactions,
@@ -1311,7 +1495,10 @@ mod tests {
         fs::write(anime_dir.join("dog").join("dog.model3.json"), "{}").unwrap();
         fs::write(anime_dir.join("dog").join("dog.vtube.json"), "{}").unwrap();
 
-        let models = discover_models_in_paths(&default_dir, &anime_dir, &default_model);
+        let models = discover_models_in_roots(
+            &[default_dir.clone(), anime_dir.clone()],
+            Some(default_model.as_path()),
+        );
 
         assert_eq!(models.len(), 2);
         assert!(models[0].is_default);
@@ -1332,7 +1519,10 @@ mod tests {
         fs::write(nagito_dir.join("NagitoModel.model3.json"), "{}").unwrap();
         fs::write(nagito_dir.join("modelv1.model3.json"), "{}").unwrap();
 
-        let models = discover_models_in_paths(&default_dir, &anime_dir, &default_model);
+        let models = discover_models_in_roots(
+            &[default_dir.clone(), anime_dir.clone()],
+            Some(default_model.as_path()),
+        );
 
         assert_eq!(models.len(), 2);
         assert!(models

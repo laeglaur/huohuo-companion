@@ -1,6 +1,13 @@
 node_modules/
 dist/
 src-tauri/target/
+local/**
+!local/
+!local/live2d/
+!local/live2d/.gitkeep
+!local/bounds/
+!local/bounds/.gitkeep
+!local/config.example.json
 
 .DS_Store
 *.log
