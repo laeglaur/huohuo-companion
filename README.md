@@ -78,10 +78,11 @@ local/live2d/Mimi/dog.model3.json
 | `Option + B` | 重新入库当前桌宠透明框 |
 | `Option + 右方向键` | 打开 Archive，需要配置 |
 | `Option + 左方向键` | 打开 Folia，需要已安装 |
-| `Option + F` | 搜索 Folia page |
+| `Option + F` | 全局搜索 Folia page，并以便签打开 |
+| `Option + N` | 用默认 Folia page 新建便签 |
 | `Option + I` | 打开 iCity |
 
-`Option + 右方向键` 在 Tauri 后端注册为全局快捷键，所以桌宠窗口不需要获得焦点。
+`Option + 右方向键`、`Option + F` 和 `Option + N` 在 Tauri 后端注册为全局快捷键，所以桌宠窗口不需要获得焦点。
 
 ## Live2D 模型下载建议
 
@@ -145,13 +146,15 @@ cp local/config.example.json local/config.json
   "defaultModelPath": null,
   "archiveAppDir": null,
   "foliaAppPath": null,
-  "foliaDataDir": null
+  "foliaDataDir": null,
+  "foliaDefaultPageId": null
 }
 ```
 
 - `live2dRoots`：递归扫描 `.model3.json` 的目录。
 - `defaultModelPath`：可选默认模型路径。
 - `archiveAppDir`：可选本地 Archive 项目目录。不配置时，`Option + 右方向键` 会提示未配置。
+- `foliaDefaultPageId`：可选默认 Folia page id。`Option + N` 会优先使用它；不配置时会依次使用 Folia 当前 page、`Inbox`、第一个 page。
 - `foliaAppPath`：可选 Folia app 路径。不配置时，会检查 `/Applications` 和 `~/Applications`。
 - `foliaDataDir`：可选 Folia 数据目录。不配置时，会检查常见 Folia 数据目录。
 
@@ -240,7 +243,8 @@ cp local/config.example.json local/config.json
 | `Option + B` | Re-run bounds onboarding for the current model |
 | `Option + Right` | Open Archive, if configured |
 | `Option + Left` | Open Folia, if installed |
-| `Option + F` | Search Folia pages |
+| `Option + F` | Globally search Folia pages and open the selected page as a card |
+| `Option + N` | Create a card on the default Folia page |
 | `Option + I` | Open iCity |
 
 ## Model Notes

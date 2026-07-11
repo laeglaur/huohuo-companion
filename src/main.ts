@@ -216,7 +216,8 @@ const lines = [
   "今天也来翻旧信。",
   "Option + → 打开 Archive。",
   "Option + ← 打开 Folia。",
-  "Option + F 搜索 Folia。",
+  "Option + F 搜索 Folia page 便签。",
+  "Option + N 新建默认 Folia page 便签。",
   "Option + I 打开 iCity。",
   "Option + ↑ / ↓ 可以切换桌宠。",
   "按住 Option 上下拖拽可以调整大小。",
@@ -1610,6 +1611,26 @@ async function openNotebook() {
   }
 }
 
+async function openNotebookSearch() {
+  hideNotebookSearch();
+  try {
+    await invoke("open_notebook_search");
+  } catch (error) {
+    speak(`Folia 搜索打不开：${String(error)}`);
+  }
+}
+
+async function openDefaultNotebookCard() {
+  hideNotebookSearch();
+  speak("便签正在打开。");
+  try {
+    await invoke("open_default_notebook_card");
+    speak("便签已打开。");
+  } catch (error) {
+    speak(`便签打不开：${String(error)}`);
+  }
+}
+
 async function openIcity() {
   hideNotebookSearch();
   speak("iCity 正在打开。");
@@ -1791,7 +1812,7 @@ document.addEventListener("keydown", async (event) => {
       await closeManualCalibration(true);
       return;
     }
-    if (event.altKey && (event.key.startsWith("Arrow") || key === "f" || key === "i" || key === "b")) {
+    if (event.altKey && (event.key.startsWith("Arrow") || key === "f" || key === "i" || key === "b" || key === "n")) {
       event.preventDefault();
       return;
     }
@@ -1804,7 +1825,14 @@ document.addEventListener("keydown", async (event) => {
   }
   if (event.altKey && (event.code === "KeyF" || key === "f")) {
     event.preventDefault();
-    showNotebookSearch();
+    if (event.repeat) return;
+    await openNotebookSearch();
+    return;
+  }
+  if (event.altKey && !isTyping && (event.code === "KeyN" || key === "n")) {
+    event.preventDefault();
+    if (event.repeat) return;
+    await openDefaultNotebookCard();
     return;
   }
   if (event.altKey && (event.code === "KeyI" || key === "i")) {

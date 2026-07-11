@@ -14,6 +14,7 @@ use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
 const NOTEBOOK_DATABASE_FILE: &str = "notebook.sqlite3";
 const SETTINGS_FILE: &str = "settings.json";
+const FOLIA_EXTERNAL_CARD_REQUESTS_DIR: &str = "external-card-requests";
 const PROJECT_ROOT: &str = env!("CARGO_MANIFEST_DIR");
 
 #[derive(Default)]
@@ -36,6 +37,7 @@ struct CompanionConfig {
     archive_app_dir: Option<String>,
     folia_app_path: Option<String>,
     folia_data_dir: Option<String>,
+    folia_default_page_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,6 +479,79 @@ fn find_folia_data_dir() -> Option<PathBuf> {
     .find(|path| path.join(NOTEBOOK_DATABASE_FILE).exists())
 }
 
+fn open_folia_database() -> Result<Connection, String> {
+    let data_dir = find_folia_data_dir().ok_or_else(|| {
+        "Folia data directory was not found. Install Folia or set foliaDataDir in local/config.json."
+            .to_string()
+    })?;
+    let db_path = data_dir.join(NOTEBOOK_DATABASE_FILE);
+    if !db_path.exists() {
+        return Err(format!("Folia database not found at {}", db_path.display()));
+    }
+    Connection::open(db_path).map_err(|error| error.to_string())
+}
+
+fn page_exists(connection: &Connection, page_id: &str) -> Result<bool, String> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pages WHERE id = ?1",
+            params![page_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(count > 0)
+}
+
+fn resolve_default_notebook_page_id() -> Result<String, String> {
+    let configured = load_companion_config()
+        .folia_default_page_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let connection = open_folia_database()?;
+    if let Some(page_id) = configured {
+        if page_exists(&connection, &page_id)? {
+            return Ok(page_id);
+        }
+        return Err(format!(
+            "Configured foliaDefaultPageId was not found: {page_id}"
+        ));
+    }
+
+    let active_page_id = connection
+        .query_row(
+            "SELECT active_page_id FROM workspace_preferences WHERE id = 1 LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if let Some(page_id) = active_page_id {
+        if page_exists(&connection, &page_id)? {
+            return Ok(page_id);
+        }
+    }
+
+    let inbox_page_id = connection
+        .query_row(
+            "SELECT id FROM pages WHERE lower(title) = 'inbox' ORDER BY rowid LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    if let Some(page_id) = inbox_page_id {
+        return Ok(page_id);
+    }
+
+    connection
+        .query_row("SELECT id FROM pages ORDER BY rowid LIMIT 1", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|_| {
+            "No Folia page was found. Create a page in Folia or set foliaDefaultPageId in local/config.json."
+                .to_string()
+        })
+}
+
 #[tauri::command]
 fn open_icity_login(app: AppHandle) -> Result<(), String> {
     open_icity_window(&app, true).map(|_| ())
@@ -652,15 +727,7 @@ fn search_notebook_pages(
     let Some(fts_query) = fts_query_from_search_text(trimmed) else {
         return Ok(Vec::new());
     };
-    let data_dir = find_folia_data_dir().ok_or_else(|| {
-        "Folia data directory was not found. Install Folia or set foliaDataDir in local/config.json."
-            .to_string()
-    })?;
-    let db_path = data_dir.join(NOTEBOOK_DATABASE_FILE);
-    if !db_path.exists() {
-        return Err(format!("Folia database not found at {}", db_path.display()));
-    }
-    let connection = Connection::open(db_path).map_err(|error| error.to_string())?;
+    let connection = open_folia_database()?;
     let max_results = i64::from(limit.unwrap_or(12).clamp(1, 30));
     let mut statement = connection
         .prepare(
@@ -700,28 +767,65 @@ fn search_notebook_pages(
 
 #[tauri::command]
 fn open_notebook_card(app: AppHandle, page_id: String) -> Result<NotebookCardLaunchResult, String> {
-    let app_path = find_folia_app().ok_or_else(|| {
-        "Folia is not installed or configured. Install Folia or set foliaAppPath in local/config.json."
-            .to_string()
+    open_notebook_card_for_page(&app, &page_id)
+}
+
+fn open_notebook_card_for_page(
+    app: &AppHandle,
+    page_id: &str,
+) -> Result<NotebookCardLaunchResult, String> {
+    let request_dir = find_folia_data_dir()
+        .map(|dir| dir.join(FOLIA_EXTERNAL_CARD_REQUESTS_DIR))
+        .unwrap_or(app_data_dir(app)?.join("folia-card-requests"));
+    fs::create_dir_all(&request_dir).map_err(|error| {
+        format!(
+            "Could not create folia external card request dir {}: {error}",
+            request_dir.display()
+        )
     })?;
-    let request_dir = app_data_dir(&app)?.join("folia-card-requests");
-    fs::create_dir_all(&request_dir)
-        .map_err(|error| format!("Could not create folia request dir: {error}"))?;
     let request_path = request_dir.join(format!("{}.notecard", request_file_stem()));
-    let request = NotebookCardRequest { page_id };
+    let request = NotebookCardRequest {
+        page_id: page_id.to_string(),
+    };
     let text = serde_json::to_string(&request)
         .map_err(|error| format!("Could not serialize folia request: {error}"))?;
     fs::write(&request_path, text)
         .map_err(|error| format!("Could not write folia request: {error}"))?;
-    Command::new("open")
-        .arg("-a")
-        .arg(&app_path)
-        .arg(&request_path)
-        .spawn()
-        .map_err(|error| format!("Could not open folia card request: {error}"))?;
+    if !is_folia_running()? {
+        let app_path = find_folia_app().ok_or_else(|| {
+            "Folia is not installed or configured. Install Folia or set foliaAppPath in local/config.json."
+                .to_string()
+        })?;
+        Command::new("open")
+            .arg("-jg")
+            .arg("-a")
+            .arg(&app_path)
+            .spawn()
+            .map_err(|error| format!("Could not launch folia in background: {error}"))?;
+    }
     Ok(NotebookCardLaunchResult {
         request_path: request_path.to_string_lossy().to_string(),
     })
+}
+
+fn is_folia_running() -> Result<bool, String> {
+    let output = Command::new("pgrep")
+        .arg("-x")
+        .arg("block_first_notebook")
+        .output()
+        .map_err(|error| format!("Could not check folia process: {error}"))?;
+    Ok(output.status.success())
+}
+
+#[tauri::command]
+fn open_default_notebook_card(app: AppHandle) -> Result<NotebookCardLaunchResult, String> {
+    let page_id = resolve_default_notebook_page_id()?;
+    open_notebook_card_for_page(&app, &page_id)
+}
+
+#[tauri::command]
+fn open_notebook_search(app: AppHandle) -> Result<(), String> {
+    open_notebook_search_window(&app)
 }
 
 #[tauri::command]
@@ -790,37 +894,103 @@ fn launch_archive_from_app(
 
 fn register_global_shortcuts(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let archive_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::ArrowRight);
-    append_log(app.handle(), "registering global shortcut option+right");
+    let search_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::KeyF);
+    let new_card_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::KeyN);
+    append_log(
+        app.handle(),
+        "registering global shortcuts option+right, option+f, option+n",
+    );
     app.handle().plugin(
         tauri_plugin_global_shortcut::Builder::new()
             .with_shortcut(archive_shortcut)?
+            .with_shortcut(search_shortcut)?
+            .with_shortcut(new_card_shortcut)?
             .with_handler(|app, shortcut, event| {
                 append_log(
                     app,
                     &format!(
-                        "global shortcut event: option+right matches={} state={:?}",
+                        "global shortcut event: option+right={} option+f={} option+n={} state={:?}",
                         shortcut.matches(Modifiers::ALT, Code::ArrowRight),
+                        shortcut.matches(Modifiers::ALT, Code::KeyF),
+                        shortcut.matches(Modifiers::ALT, Code::KeyN),
                         event.state
                     ),
                 );
                 if event.state != ShortcutState::Pressed {
                     return;
                 }
-                if !shortcut.matches(Modifiers::ALT, Code::ArrowRight) {
+
+                if shortcut.matches(Modifiers::ALT, Code::ArrowRight) {
+                    append_log(app, "global shortcut option+right: launch archive");
+                    let state = app.state::<ArchiveProcess>();
+                    if let Err(error) = launch_archive_from_app(app, &state) {
+                        append_log(
+                            app,
+                            &format!("global shortcut launch archive failed: {error}"),
+                        );
+                    }
                     return;
                 }
-                append_log(app, "global shortcut option+right: launch archive");
-                let state = app.state::<ArchiveProcess>();
-                if let Err(error) = launch_archive_from_app(app, &state) {
-                    append_log(
-                        app,
-                        &format!("global shortcut launch archive failed: {error}"),
-                    );
+
+                if shortcut.matches(Modifiers::ALT, Code::KeyF) {
+                    append_log(app, "global shortcut option+f: open notebook search");
+                    if let Err(error) = open_notebook_search_window(app) {
+                        append_log(
+                            app,
+                            &format!("global shortcut open notebook search failed: {error}"),
+                        );
+                    }
+                    return;
+                }
+
+                if shortcut.matches(Modifiers::ALT, Code::KeyN) {
+                    append_log(app, "global shortcut option+n: open default notebook card");
+                    if let Err(error) = open_default_notebook_card(app.clone()) {
+                        append_log(
+                            app,
+                            &format!("global shortcut open default notebook card failed: {error}"),
+                        );
+                    }
                 }
             })
             .build(),
     )?;
-    append_log(app.handle(), "registered global shortcut option+right");
+    append_log(
+        app.handle(),
+        "registered global shortcuts option+right, option+f, option+n",
+    );
+    Ok(())
+}
+
+fn open_notebook_search_window(app: &AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("notebook-search") {
+        window
+            .unminimize()
+            .map_err(|error| format!("Could not unminimize Folia search window: {error}"))?;
+        window
+            .show()
+            .map_err(|error| format!("Could not show Folia search window: {error}"))?;
+        window
+            .set_focus()
+            .map_err(|error| format!("Could not focus Folia search window: {error}"))?;
+        return Ok(());
+    }
+
+    WebviewWindowBuilder::new(
+        app,
+        "notebook-search",
+        WebviewUrl::App("search.html".into()),
+    )
+    .title("Search Folia")
+    .inner_size(420.0, 300.0)
+    .min_inner_size(340.0, 220.0)
+    .resizable(false)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .visible(true)
+    .build()
+    .map_err(|error| format!("Could not create Folia search window: {error}"))?;
     Ok(())
 }
 
@@ -1458,6 +1628,8 @@ pub fn run() {
             open_icity_login,
             search_notebook_pages,
             open_notebook_card,
+            open_default_notebook_card,
+            open_notebook_search,
             launch_archive,
             reset_position,
             quit_app
@@ -1593,7 +1765,10 @@ mod tests {
             .iter()
             .map(|reaction| match reaction.kind.as_str() {
                 "motion" => format!("motion:{}", reaction.group.as_deref().unwrap_or("")),
-                "expression" => format!("expression:{}", reaction.expression.as_deref().unwrap_or("")),
+                "expression" => format!(
+                    "expression:{}",
+                    reaction.expression.as_deref().unwrap_or("")
+                ),
                 _ => reaction.kind.clone(),
             })
             .collect();
@@ -1601,7 +1776,12 @@ mod tests {
         assert!(keys.contains(&"motion:qizi".to_string()));
         assert!(keys.contains(&"motion:Scene1".to_string()));
         assert!(keys.contains(&"expression:qizi1".to_string()));
-        assert_eq!(keys.iter().filter(|key| key.as_str() == "motion:qizi").count(), 1);
+        assert_eq!(
+            keys.iter()
+                .filter(|key| key.as_str() == "motion:qizi")
+                .count(),
+            1
+        );
     }
 
     #[test]

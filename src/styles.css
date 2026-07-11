@@ -295,6 +295,39 @@ body.is-resizing .pet:active {
   padding-top: 5px;
 }
 
+.search-window-body {
+  background: rgba(246, 244, 236, 0.98);
+}
+
+.notebook-search-shell {
+  width: 100vw;
+  height: 100vh;
+  box-sizing: border-box;
+  background: rgba(246, 244, 236, 0.98);
+  overflow: hidden;
+}
+
+.notebook-search-shell .notebook-search {
+  left: 0;
+  top: 0;
+  width: 100vw;
+  height: 100vh;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+  padding: 10px;
+}
+
+.notebook-search-shell .notebook-search input {
+  height: 34px;
+  font-size: 13px;
+}
+
+.notebook-search-shell .notebook-search-results {
+  max-height: calc(100vh - 50px);
+}
+
 .notebook-search-results p {
   margin: 4px 2px;
   color: #6b7f79;

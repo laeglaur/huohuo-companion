@@ -3,5 +3,6 @@
   "defaultModelPath": null,
   "archiveAppDir": null,
   "foliaAppPath": null,
-  "foliaDataDir": null
+  "foliaDataDir": null,
+  "foliaDefaultPageId": null
 }
