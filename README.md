@@ -80,9 +80,10 @@ local/live2d/Mimi/dog.model3.json
 | `Option + 左方向键` | 打开 Folia，需要已安装 |
 | `Option + F` | 全局搜索 Folia page，并以便签打开 |
 | `Option + N` | 用默认 Folia page 新建便签 |
+| `Option + C` | 把当前选中内容发到 ChatGPT 桌面版浮窗 |
 | `Option + I` | 打开 iCity |
 
-`Option + 右方向键`、`Option + F` 和 `Option + N` 在 Tauri 后端注册为全局快捷键，所以桌宠窗口不需要获得焦点。
+`Option + 右方向键`、`Option + F`、`Option + N` 和 `Option + C` 在 Tauri 后端注册为全局快捷键，所以桌宠窗口不需要获得焦点。`Option + C` 会模拟复制当前选区、打开 ChatGPT 桌面版的 `Option + Space` 浮窗并粘贴；需要安装 ChatGPT 桌面版，并给 huohuo 授予辅助功能权限。
 
 ## Live2D 模型下载建议
 
@@ -245,6 +246,7 @@ cp local/config.example.json local/config.json
 | `Option + Left` | Open Folia, if installed |
 | `Option + F` | Globally search Folia pages and open the selected page as a card |
 | `Option + N` | Create a card on the default Folia page |
+| `Option + C` | Send the current selection to the ChatGPT desktop floating prompt |
 | `Option + I` | Open iCity |
 
 ## Model Notes

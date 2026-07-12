@@ -1,3 +1,5 @@
+use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, KeyCode};
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -6,6 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,6 +19,7 @@ const NOTEBOOK_DATABASE_FILE: &str = "notebook.sqlite3";
 const SETTINGS_FILE: &str = "settings.json";
 const FOLIA_EXTERNAL_CARD_REQUESTS_DIR: &str = "external-card-requests";
 const PROJECT_ROOT: &str = env!("CARGO_MANIFEST_DIR");
+static CHATGPT_HANDOFF_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
 struct ArchiveProcess(Mutex<Option<Child>>);
@@ -896,23 +900,26 @@ fn register_global_shortcuts(app: &tauri::App) -> Result<(), Box<dyn std::error:
     let archive_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::ArrowRight);
     let search_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::KeyF);
     let new_card_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::KeyN);
+    let chatgpt_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::KeyC);
     append_log(
         app.handle(),
-        "registering global shortcuts option+right, option+f, option+n",
+        "registering global shortcuts option+right, option+f, option+n, option+c",
     );
     app.handle().plugin(
         tauri_plugin_global_shortcut::Builder::new()
             .with_shortcut(archive_shortcut)?
             .with_shortcut(search_shortcut)?
             .with_shortcut(new_card_shortcut)?
+            .with_shortcut(chatgpt_shortcut)?
             .with_handler(|app, shortcut, event| {
                 append_log(
                     app,
                     &format!(
-                        "global shortcut event: option+right={} option+f={} option+n={} state={:?}",
+                        "global shortcut event: option+right={} option+f={} option+n={} option+c={} state={:?}",
                         shortcut.matches(Modifiers::ALT, Code::ArrowRight),
                         shortcut.matches(Modifiers::ALT, Code::KeyF),
                         shortcut.matches(Modifiers::ALT, Code::KeyN),
+                        shortcut.matches(Modifiers::ALT, Code::KeyC),
                         event.state
                     ),
                 );
@@ -951,14 +958,77 @@ fn register_global_shortcuts(app: &tauri::App) -> Result<(), Box<dyn std::error:
                             &format!("global shortcut open default notebook card failed: {error}"),
                         );
                     }
+                    return;
+                }
+
+                if shortcut.matches(Modifiers::ALT, Code::KeyC) {
+                    append_log(app, "global shortcut option+c: open ChatGPT with selection");
+                    let Some(handoff_guard) = ChatGptHandoffGuard::try_begin() else {
+                        append_log(app, "global shortcut option+c ignored: handoff already running");
+                        return;
+                    };
+                    let app = app.clone();
+                    thread::spawn(move || {
+                        let _handoff_guard = handoff_guard;
+                        if let Err(error) = handoff_selection_to_chatgpt() {
+                            append_log(
+                                &app,
+                                &format!("global shortcut open ChatGPT failed: {error}"),
+                            );
+                        }
+                    });
                 }
             })
             .build(),
     )?;
     append_log(
         app.handle(),
-        "registered global shortcuts option+right, option+f, option+n",
+        "registered global shortcuts option+right, option+f, option+n, option+c",
     );
+    Ok(())
+}
+
+struct ChatGptHandoffGuard;
+
+impl ChatGptHandoffGuard {
+    fn try_begin() -> Option<Self> {
+        CHATGPT_HANDOFF_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for ChatGptHandoffGuard {
+    fn drop(&mut self) {
+        CHATGPT_HANDOFF_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
+
+fn handoff_selection_to_chatgpt() -> Result<(), String> {
+    // Give the Option+C hotkey a short release window before asking the source
+    // app to copy. Otherwise some apps can see Cmd+Option+C instead of Cmd+C.
+    thread::sleep(Duration::from_millis(120));
+    post_key(KeyCode::ANSI_C, CGEventFlags::CGEventFlagCommand)
+        .map_err(|error| format!("Cmd+C failed: {error}"))?;
+    thread::sleep(Duration::from_millis(350));
+    post_key(KeyCode::SPACE, CGEventFlags::CGEventFlagAlternate)?;
+    thread::sleep(Duration::from_millis(550));
+    post_key(KeyCode::ANSI_V, CGEventFlags::CGEventFlagCommand)
+}
+
+fn post_key(keycode: u16, flags: CGEventFlags) -> Result<(), String> {
+    let source = CGEventSource::new(CGEventSourceStateID::Private)
+        .map_err(|_| "Could not create CGEventSource.".to_string())?;
+    let key_down = CGEvent::new_keyboard_event(source.clone(), keycode, true)
+        .map_err(|_| "Could not create key-down CGEvent.".to_string())?;
+    let key_up = CGEvent::new_keyboard_event(source, keycode, false)
+        .map_err(|_| "Could not create key-up CGEvent.".to_string())?;
+
+    key_down.set_flags(flags);
+    key_up.set_flags(flags);
+    key_down.post(CGEventTapLocation::HID);
+    key_up.post(CGEventTapLocation::HID);
     Ok(())
 }
 
