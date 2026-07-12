@@ -24,6 +24,7 @@ const MAX_WEB_CONTEXT_CHARS: usize = 18_000;
 const MAX_NOTE_CONTEXT_CHARS: usize = 18_000;
 const MAX_SELECTION_CHARS: usize = 8_000;
 const CHATGPT_PROMPT_READY_DELAY_MS: u64 = 1_150;
+const TRANSLATE_PROMPT_SUFFIX: &str = "请翻译我选中的内容。要求：如果原文是外语，翻译成自然准确的中文；如果原文是中文，翻译成自然英文；必要时解释关键词、短语、专有名词和上下文含义。请先给译文，再给简短注释。";
 static CHATGPT_HANDOFF_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
@@ -906,9 +907,10 @@ fn register_global_shortcuts(app: &tauri::App) -> Result<(), Box<dyn std::error:
     let search_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::KeyF);
     let new_card_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::KeyN);
     let chatgpt_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::KeyC);
+    let translate_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::KeyX);
     append_log(
         app.handle(),
-        "registering global shortcuts option+right, option+f, option+n, option+c",
+        "registering global shortcuts option+right, option+f, option+n, option+c, option+x",
     );
     app.handle().plugin(
         tauri_plugin_global_shortcut::Builder::new()
@@ -916,15 +918,17 @@ fn register_global_shortcuts(app: &tauri::App) -> Result<(), Box<dyn std::error:
             .with_shortcut(search_shortcut)?
             .with_shortcut(new_card_shortcut)?
             .with_shortcut(chatgpt_shortcut)?
+            .with_shortcut(translate_shortcut)?
             .with_handler(|app, shortcut, event| {
                 append_log(
                     app,
                     &format!(
-                        "global shortcut event: option+right={} option+f={} option+n={} option+c={} state={:?}",
+                        "global shortcut event: option+right={} option+f={} option+n={} option+c={} option+x={} state={:?}",
                         shortcut.matches(Modifiers::ALT, Code::ArrowRight),
                         shortcut.matches(Modifiers::ALT, Code::KeyF),
                         shortcut.matches(Modifiers::ALT, Code::KeyN),
                         shortcut.matches(Modifiers::ALT, Code::KeyC),
+                        shortcut.matches(Modifiers::ALT, Code::KeyX),
                         event.state
                     ),
                 );
@@ -975,10 +979,32 @@ fn register_global_shortcuts(app: &tauri::App) -> Result<(), Box<dyn std::error:
                     let app = app.clone();
                     thread::spawn(move || {
                         let _handoff_guard = handoff_guard;
-                        if let Err(error) = handoff_selection_to_chatgpt(&app) {
+                        if let Err(error) =
+                            handoff_selection_to_chatgpt(&app, ChatGptHandoffMode::Ask)
+                        {
                             append_log(
                                 &app,
                                 &format!("global shortcut open ChatGPT failed: {error}"),
+                            );
+                        }
+                    });
+                }
+
+                if shortcut.matches(Modifiers::ALT, Code::KeyX) {
+                    append_log(app, "global shortcut option+x: translate selection with ChatGPT");
+                    let Some(handoff_guard) = ChatGptHandoffGuard::try_begin() else {
+                        append_log(app, "global shortcut option+x ignored: handoff already running");
+                        return;
+                    };
+                    let app = app.clone();
+                    thread::spawn(move || {
+                        let _handoff_guard = handoff_guard;
+                        if let Err(error) =
+                            handoff_selection_to_chatgpt(&app, ChatGptHandoffMode::Translate)
+                        {
+                            append_log(
+                                &app,
+                                &format!("global shortcut translate with ChatGPT failed: {error}"),
                             );
                         }
                     });
@@ -988,12 +1014,18 @@ fn register_global_shortcuts(app: &tauri::App) -> Result<(), Box<dyn std::error:
     )?;
     append_log(
         app.handle(),
-        "registered global shortcuts option+right, option+f, option+n, option+c",
+        "registered global shortcuts option+right, option+f, option+n, option+c, option+x",
     );
     Ok(())
 }
 
 struct ChatGptHandoffGuard;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatGptHandoffMode {
+    Ask,
+    Translate,
+}
 
 impl ChatGptHandoffGuard {
     fn try_begin() -> Option<Self> {
@@ -1010,7 +1042,7 @@ impl Drop for ChatGptHandoffGuard {
     }
 }
 
-fn handoff_selection_to_chatgpt(app: &AppHandle) -> Result<(), String> {
+fn handoff_selection_to_chatgpt(app: &AppHandle, mode: ChatGptHandoffMode) -> Result<(), String> {
     // Give the Option+C hotkey a short release window before asking the source
     // app to copy. Otherwise some apps can see Cmd+Option+C instead of Cmd+C.
     thread::sleep(Duration::from_millis(120));
@@ -1027,7 +1059,7 @@ fn handoff_selection_to_chatgpt(app: &AppHandle) -> Result<(), String> {
             selection.chars().count()
         ),
     );
-    let prompt = build_chatgpt_handoff_text(app, &source_app, &selection);
+    let prompt = build_chatgpt_handoff_text(app, &source_app, &selection, mode);
     if let Some(prompt) = prompt.as_ref() {
         append_log(
             app,
@@ -1057,13 +1089,14 @@ fn build_chatgpt_handoff_text(
     app: &AppHandle,
     source_app: &str,
     selection: &str,
+    mode: ChatGptHandoffMode,
 ) -> Option<String> {
     if is_chatgpt_native_context_app(source_app) {
         append_log(
             app,
             &format!("chatgpt handoff: skip native context app {source_app:?}"),
         );
-        return None;
+        return compose_selection_only_prompt(selection, mode);
     }
 
     if source_app == "Google Chrome" {
@@ -1078,7 +1111,7 @@ fn build_chatgpt_handoff_text(
                         page_context.text.chars().count()
                     ),
                 );
-                return compose_web_context_prompt(&page_context, selection);
+                return compose_web_context_prompt(&page_context, selection, mode);
             }
             Err(error) => {
                 append_log(
@@ -1100,7 +1133,7 @@ fn build_chatgpt_handoff_text(
                         page_context.text.chars().count()
                     ),
                 );
-                return compose_note_context_prompt(&page_context, selection);
+                return compose_note_context_prompt(&page_context, selection, mode);
             }
             Err(error) => {
                 append_log(
@@ -1111,7 +1144,7 @@ fn build_chatgpt_handoff_text(
         }
     }
 
-    None
+    compose_selection_only_prompt(selection, mode)
 }
 
 fn is_chatgpt_native_context_app(app_name: &str) -> bool {
@@ -1138,7 +1171,11 @@ struct NotePageContext {
     text: String,
 }
 
-fn compose_web_context_prompt(context: &WebPageContext, selection: &str) -> Option<String> {
+fn compose_web_context_prompt(
+    context: &WebPageContext,
+    selection: &str,
+    mode: ChatGptHandoffMode,
+) -> Option<String> {
     let page_text = truncate_chars(context.text.trim(), MAX_WEB_CONTEXT_CHARS);
     let selection_text = truncate_chars(selection.trim(), MAX_SELECTION_CHARS);
 
@@ -1168,10 +1205,15 @@ fn compose_web_context_prompt(context: &WebPageContext, selection: &str) -> Opti
         prompt.push_str(&selection_text);
         prompt.push('\n');
     }
+    append_handoff_mode_suffix(&mut prompt, mode);
     Some(prompt)
 }
 
-fn compose_note_context_prompt(context: &NotePageContext, selection: &str) -> Option<String> {
+fn compose_note_context_prompt(
+    context: &NotePageContext,
+    selection: &str,
+    mode: ChatGptHandoffMode,
+) -> Option<String> {
     let page_text = truncate_chars(context.text.trim(), MAX_NOTE_CONTEXT_CHARS);
     let selection_text = truncate_chars(selection.trim(), MAX_SELECTION_CHARS);
 
@@ -1196,7 +1238,36 @@ fn compose_note_context_prompt(context: &NotePageContext, selection: &str) -> Op
         prompt.push_str(&selection_text);
         prompt.push('\n');
     }
+    append_handoff_mode_suffix(&mut prompt, mode);
     Some(prompt)
+}
+
+fn compose_selection_only_prompt(selection: &str, mode: ChatGptHandoffMode) -> Option<String> {
+    let selection_text = truncate_chars(selection.trim(), MAX_SELECTION_CHARS);
+    if selection_text.is_empty() {
+        return None;
+    }
+    if mode == ChatGptHandoffMode::Ask {
+        return None;
+    }
+
+    let mut prompt = String::new();
+    prompt.push_str("我选中的内容：\n");
+    prompt.push_str(&selection_text);
+    prompt.push('\n');
+    append_handoff_mode_suffix(&mut prompt, mode);
+    Some(prompt)
+}
+
+fn append_handoff_mode_suffix(prompt: &mut String, mode: ChatGptHandoffMode) {
+    match mode {
+        ChatGptHandoffMode::Ask => {}
+        ChatGptHandoffMode::Translate => {
+            prompt.push_str("\n任务：\n");
+            prompt.push_str(TRANSLATE_PROMPT_SUFFIX);
+            prompt.push('\n');
+        }
+    }
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -1282,38 +1353,19 @@ fn run_osascript(script: &str) -> Result<String, String> {
 }
 
 fn read_clipboard_text() -> Result<String, String> {
-    let output = Command::new("pbpaste")
-        .output()
-        .map_err(|error| format!("Could not run pbpaste: {error}"))?;
-
-    if !output.status.success() {
-        return Err("pbpaste failed.".to_string());
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|error| format!("Could not open clipboard: {error}"))?;
+    clipboard
+        .get_text()
+        .map_err(|error| format!("Could not read clipboard text: {error}"))
 }
 
 fn write_clipboard_text(text: &str) -> Result<(), String> {
-    let mut child = Command::new("pbcopy")
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("Could not run pbcopy: {error}"))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "Could not open pbcopy stdin.".to_string())?;
-    stdin
-        .write_all(text.as_bytes())
-        .map_err(|error| format!("Could not write to pbcopy: {error}"))?;
-    drop(stdin);
-
-    let status = child
-        .wait()
-        .map_err(|error| format!("Could not wait for pbcopy: {error}"))?;
-    if !status.success() {
-        return Err("pbcopy failed.".to_string());
-    }
-    Ok(())
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|error| format!("Could not open clipboard: {error}"))?;
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|error| format!("Could not write clipboard text: {error}"))
 }
 
 fn post_key(keycode: u16, flags: CGEventFlags) -> Result<(), String> {
@@ -2044,6 +2096,7 @@ mod tests {
                 text: "Page body".to_string(),
             },
             "What does this mean?",
+            ChatGptHandoffMode::Ask,
         )
         .unwrap();
 
@@ -2061,12 +2114,28 @@ mod tests {
                 text: "Note body".to_string(),
             },
             "Question",
+            ChatGptHandoffMode::Ask,
         )
         .unwrap();
 
         assert!(prompt.contains("Page: Inbox"));
         assert!(prompt.contains("页面正文：\nNote body"));
         assert!(prompt.contains("我选中的内容/问题：\nQuestion"));
+    }
+
+    #[test]
+    fn composes_translate_prompt_for_selection_only() {
+        let prompt =
+            compose_selection_only_prompt("hello world", ChatGptHandoffMode::Translate).unwrap();
+
+        assert!(prompt.contains("我选中的内容：\nhello world"));
+        assert!(prompt.contains("任务："));
+        assert!(prompt.contains("请翻译我选中的内容"));
+    }
+
+    #[test]
+    fn ask_mode_does_not_wrap_selection_only_prompt() {
+        assert!(compose_selection_only_prompt("hello world", ChatGptHandoffMode::Ask).is_none());
     }
 
     #[test]

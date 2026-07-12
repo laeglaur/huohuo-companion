@@ -81,9 +81,10 @@ local/live2d/Mimi/dog.model3.json
 | `Option + F` | 全局搜索 Folia page，并以便签打开 |
 | `Option + N` | 用默认 Folia page 新建便签 |
 | `Option + C` | 把当前选中内容发到 ChatGPT 桌面版浮窗，Chrome/Folia 会附带上下文 |
+| `Option + X` | 查词/翻译当前选中内容，Chrome/Folia 会附带上下文 |
 | `Option + I` | 打开 iCity |
 
-`Option + 右方向键`、`Option + F`、`Option + N` 和 `Option + C` 在 Tauri 后端注册为全局快捷键，所以桌宠窗口不需要获得焦点。`Option + C` 会模拟复制当前选区、打开 ChatGPT 桌面版的 `Option + Space` 浮窗并粘贴；如果前台是 Chrome，会先读取当前标签页的标题、URL 和网页正文作为前缀；如果前台是 Folia，会读取当前 active page 的标题和正文作为前缀。备忘录、终端、iTerm2、VS Code 和 Notion 等 ChatGPT 桌面版原生支持上下文的应用不会额外注入前缀。需要安装 ChatGPT 桌面版，并给 huohuo 授予辅助功能权限；Chrome 网页正文读取需要开启 `查看 > 开发者 > 允许 Apple 事件中的 JavaScript`。
+`Option + 右方向键`、`Option + F`、`Option + N`、`Option + C` 和 `Option + X` 在 Tauri 后端注册为全局快捷键，所以桌宠窗口不需要获得焦点。`Option + C` 会模拟复制当前选区、打开 ChatGPT 桌面版的 `Option + Space` 浮窗并粘贴；如果前台是 Chrome，会先读取当前标签页的标题、URL 和网页正文作为前缀；如果前台是 Folia，会读取当前 active page 的标题和正文作为前缀。`Option + X` 使用同一套上下文，但会追加查词/翻译指令。备忘录、终端、iTerm2、VS Code 和 Notion 等 ChatGPT 桌面版原生支持上下文的应用不会额外注入前缀。需要安装 ChatGPT 桌面版，并给 huohuo 授予辅助功能权限；Chrome 网页正文读取需要开启 `查看 > 开发者 > 允许 Apple 事件中的 JavaScript`。
 
 ## Live2D 模型下载建议
 
@@ -247,6 +248,7 @@ cp local/config.example.json local/config.json
 | `Option + F` | Globally search Folia pages and open the selected page as a card |
 | `Option + N` | Create a card on the default Folia page |
 | `Option + C` | Send the current selection to the ChatGPT desktop floating prompt; Chrome/Folia include context |
+| `Option + X` | Translate/look up the current selection with ChatGPT; Chrome/Folia include context |
 | `Option + I` | Open iCity |
 
 ## Model Notes
