@@ -1,6 +1,6 @@
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, KeyCode};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -19,6 +19,11 @@ const NOTEBOOK_DATABASE_FILE: &str = "notebook.sqlite3";
 const SETTINGS_FILE: &str = "settings.json";
 const FOLIA_EXTERNAL_CARD_REQUESTS_DIR: &str = "external-card-requests";
 const PROJECT_ROOT: &str = env!("CARGO_MANIFEST_DIR");
+const CHROME_CONTEXT_SEPARATOR: &str = "<<<HUOHUO_FIELD>>>";
+const MAX_WEB_CONTEXT_CHARS: usize = 18_000;
+const MAX_NOTE_CONTEXT_CHARS: usize = 18_000;
+const MAX_SELECTION_CHARS: usize = 8_000;
+const CHATGPT_PROMPT_READY_DELAY_MS: u64 = 1_150;
 static CHATGPT_HANDOFF_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
@@ -970,7 +975,7 @@ fn register_global_shortcuts(app: &tauri::App) -> Result<(), Box<dyn std::error:
                     let app = app.clone();
                     thread::spawn(move || {
                         let _handoff_guard = handoff_guard;
-                        if let Err(error) = handoff_selection_to_chatgpt() {
+                        if let Err(error) = handoff_selection_to_chatgpt(&app) {
                             append_log(
                                 &app,
                                 &format!("global shortcut open ChatGPT failed: {error}"),
@@ -1005,16 +1010,310 @@ impl Drop for ChatGptHandoffGuard {
     }
 }
 
-fn handoff_selection_to_chatgpt() -> Result<(), String> {
+fn handoff_selection_to_chatgpt(app: &AppHandle) -> Result<(), String> {
     // Give the Option+C hotkey a short release window before asking the source
     // app to copy. Otherwise some apps can see Cmd+Option+C instead of Cmd+C.
     thread::sleep(Duration::from_millis(120));
+    let source_app = frontmost_app_name().unwrap_or_default();
+    append_log(app, &format!("chatgpt handoff: source_app={source_app:?}"));
     post_key(KeyCode::ANSI_C, CGEventFlags::CGEventFlagCommand)
         .map_err(|error| format!("Cmd+C failed: {error}"))?;
     thread::sleep(Duration::from_millis(350));
+    let selection = read_clipboard_text().unwrap_or_default();
+    append_log(
+        app,
+        &format!(
+            "chatgpt handoff: selection_chars={}",
+            selection.chars().count()
+        ),
+    );
+    let prompt = build_chatgpt_handoff_text(app, &source_app, &selection);
+    if let Some(prompt) = prompt.as_ref() {
+        append_log(
+            app,
+            &format!("chatgpt handoff: prompt_chars={}", prompt.chars().count()),
+        );
+    } else {
+        append_log(app, "chatgpt handoff: no external context prompt");
+    }
     post_key(KeyCode::SPACE, CGEventFlags::CGEventFlagAlternate)?;
-    thread::sleep(Duration::from_millis(550));
+    thread::sleep(Duration::from_millis(CHATGPT_PROMPT_READY_DELAY_MS));
+    if let Some(prompt) = prompt.as_ref() {
+        write_clipboard_text(prompt)?;
+        thread::sleep(Duration::from_millis(180));
+        let clipboard_chars = read_clipboard_text()
+            .map(|value| value.chars().count())
+            .unwrap_or(0);
+        append_log(
+            app,
+            &format!("chatgpt handoff: clipboard_chars_before_paste={clipboard_chars}"),
+        );
+    }
+    append_log(app, "chatgpt handoff: paste prompt");
     post_key(KeyCode::ANSI_V, CGEventFlags::CGEventFlagCommand)
+}
+
+fn build_chatgpt_handoff_text(
+    app: &AppHandle,
+    source_app: &str,
+    selection: &str,
+) -> Option<String> {
+    if is_chatgpt_native_context_app(source_app) {
+        append_log(
+            app,
+            &format!("chatgpt handoff: skip native context app {source_app:?}"),
+        );
+        return None;
+    }
+
+    if source_app == "Google Chrome" {
+        match capture_chrome_page_context() {
+            Ok(page_context) => {
+                append_log(
+                    app,
+                    &format!(
+                        "chatgpt handoff: chrome context title_chars={} url_chars={} text_chars={}",
+                        page_context.title.chars().count(),
+                        page_context.url.chars().count(),
+                        page_context.text.chars().count()
+                    ),
+                );
+                return compose_web_context_prompt(&page_context, selection);
+            }
+            Err(error) => {
+                append_log(
+                    app,
+                    &format!("chatgpt handoff: chrome context failed: {error}"),
+                );
+            }
+        }
+    }
+
+    if is_folia_app(source_app) {
+        match capture_folia_current_page_context() {
+            Ok(page_context) => {
+                append_log(
+                    app,
+                    &format!(
+                        "chatgpt handoff: folia context title_chars={} text_chars={}",
+                        page_context.title.chars().count(),
+                        page_context.text.chars().count()
+                    ),
+                );
+                return compose_note_context_prompt(&page_context, selection);
+            }
+            Err(error) => {
+                append_log(
+                    app,
+                    &format!("chatgpt handoff: folia context failed: {error}"),
+                );
+            }
+        }
+    }
+
+    None
+}
+
+fn is_chatgpt_native_context_app(app_name: &str) -> bool {
+    matches!(
+        app_name,
+        "Notes" | "备忘录" | "Terminal" | "iTerm2" | "Code" | "Visual Studio Code" | "Notion"
+    )
+}
+
+fn is_folia_app(app_name: &str) -> bool {
+    matches!(app_name, "folia" | "Folia" | "block_first_notebook")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebPageContext {
+    title: String,
+    url: String,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NotePageContext {
+    title: String,
+    text: String,
+}
+
+fn compose_web_context_prompt(context: &WebPageContext, selection: &str) -> Option<String> {
+    let page_text = truncate_chars(context.text.trim(), MAX_WEB_CONTEXT_CHARS);
+    let selection_text = truncate_chars(selection.trim(), MAX_SELECTION_CHARS);
+
+    if page_text.is_empty() && selection_text.is_empty() {
+        return None;
+    }
+
+    let mut prompt = String::new();
+    prompt.push_str("我正在浏览这个网页，请结合网页上下文回答。\n\n");
+    if !context.title.trim().is_empty() {
+        prompt.push_str("Title: ");
+        prompt.push_str(context.title.trim());
+        prompt.push('\n');
+    }
+    if !context.url.trim().is_empty() {
+        prompt.push_str("URL: ");
+        prompt.push_str(context.url.trim());
+        prompt.push('\n');
+    }
+    if !page_text.is_empty() {
+        prompt.push_str("\n网页正文：\n");
+        prompt.push_str(&page_text);
+        prompt.push('\n');
+    }
+    if !selection_text.is_empty() {
+        prompt.push_str("\n我选中的内容/问题：\n");
+        prompt.push_str(&selection_text);
+        prompt.push('\n');
+    }
+    Some(prompt)
+}
+
+fn compose_note_context_prompt(context: &NotePageContext, selection: &str) -> Option<String> {
+    let page_text = truncate_chars(context.text.trim(), MAX_NOTE_CONTEXT_CHARS);
+    let selection_text = truncate_chars(selection.trim(), MAX_SELECTION_CHARS);
+
+    if page_text.is_empty() && selection_text.is_empty() {
+        return None;
+    }
+
+    let mut prompt = String::new();
+    prompt.push_str("我正在阅读/编辑这个笔记页面，请结合页面上下文回答。\n\n");
+    if !context.title.trim().is_empty() {
+        prompt.push_str("Page: ");
+        prompt.push_str(context.title.trim());
+        prompt.push('\n');
+    }
+    if !page_text.is_empty() {
+        prompt.push_str("\n页面正文：\n");
+        prompt.push_str(&page_text);
+        prompt.push('\n');
+    }
+    if !selection_text.is_empty() {
+        prompt.push_str("\n我选中的内容/问题：\n");
+        prompt.push_str(&selection_text);
+        prompt.push('\n');
+    }
+    Some(prompt)
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut iter = value.chars();
+    let truncated: String = iter.by_ref().take(max_chars).collect();
+    if iter.next().is_some() {
+        format!("{truncated}\n...[truncated]")
+    } else {
+        truncated
+    }
+}
+
+fn frontmost_app_name() -> Result<String, String> {
+    let script = r#"tell application "System Events" to get name of first application process whose frontmost is true"#;
+    run_osascript(script).map(|value| value.trim().to_string())
+}
+
+fn capture_chrome_page_context() -> Result<WebPageContext, String> {
+    let script = r#"tell application "Google Chrome"
+  if (count of windows) = 0 then error "No Chrome window"
+  set pageTitle to title of active tab of front window
+  set pageUrl to URL of active tab of front window
+  set pageText to execute active tab of front window javascript "document.body.innerText"
+  return pageTitle & "<<<HUOHUO_FIELD>>>" & pageUrl & "<<<HUOHUO_FIELD>>>" & pageText
+end tell"#;
+    let output = run_osascript(script)?;
+    let mut parts = output.splitn(3, CHROME_CONTEXT_SEPARATOR);
+    let title = parts.next().unwrap_or_default().trim().to_string();
+    let url = parts.next().unwrap_or_default().trim().to_string();
+    let text = parts.next().unwrap_or_default().trim().to_string();
+    Ok(WebPageContext { title, url, text })
+}
+
+fn capture_folia_current_page_context() -> Result<NotePageContext, String> {
+    let data_dir = find_folia_data_dir().ok_or_else(|| {
+        "Folia data directory was not found. Install Folia or set foliaDataDir in local/config.json."
+            .to_string()
+    })?;
+    let db_path = data_dir.join(NOTEBOOK_DATABASE_FILE);
+    let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    connection
+        .query_row(
+            "
+            SELECT pages.title, pages.search_text
+            FROM pages
+            WHERE pages.id = (
+              SELECT active_page_id
+              FROM workspace_preferences
+              WHERE id = 1
+              LIMIT 1
+            )
+            LIMIT 1
+            ",
+            [],
+            |row| {
+                Ok(NotePageContext {
+                    title: row.get(0)?,
+                    text: row.get(1)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn run_osascript(script: &str) -> Result<String, String> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|error| format!("Could not run osascript: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "osascript failed without stderr.".to_string()
+        } else {
+            stderr
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn read_clipboard_text() -> Result<String, String> {
+    let output = Command::new("pbpaste")
+        .output()
+        .map_err(|error| format!("Could not run pbpaste: {error}"))?;
+
+    if !output.status.success() {
+        return Err("pbpaste failed.".to_string());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn write_clipboard_text(text: &str) -> Result<(), String> {
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Could not run pbcopy: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Could not open pbcopy stdin.".to_string())?;
+    stdin
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("Could not write to pbcopy: {error}"))?;
+    drop(stdin);
+
+    let status = child
+        .wait()
+        .map_err(|error| format!("Could not wait for pbcopy: {error}"))?;
+    if !status.success() {
+        return Err("pbcopy failed.".to_string());
+    }
+    Ok(())
 }
 
 fn post_key(keycode: u16, flags: CGEventFlags) -> Result<(), String> {
@@ -1725,6 +2024,50 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skips_apps_with_chatgpt_native_context() {
+        assert!(is_chatgpt_native_context_app("iTerm2"));
+        assert!(is_chatgpt_native_context_app("Code"));
+        assert!(is_chatgpt_native_context_app("Notion"));
+        assert!(!is_chatgpt_native_context_app("Google Chrome"));
+        assert!(!is_chatgpt_native_context_app("folia"));
+        assert!(is_folia_app("folia"));
+    }
+
+    #[test]
+    fn composes_web_context_prompt_with_selection() {
+        let prompt = compose_web_context_prompt(
+            &WebPageContext {
+                title: "Example Page".to_string(),
+                url: "https://example.com".to_string(),
+                text: "Page body".to_string(),
+            },
+            "What does this mean?",
+        )
+        .unwrap();
+
+        assert!(prompt.contains("Title: Example Page"));
+        assert!(prompt.contains("URL: https://example.com"));
+        assert!(prompt.contains("网页正文：\nPage body"));
+        assert!(prompt.contains("我选中的内容/问题：\nWhat does this mean?"));
+    }
+
+    #[test]
+    fn composes_note_context_prompt_with_selection() {
+        let prompt = compose_note_context_prompt(
+            &NotePageContext {
+                title: "Inbox".to_string(),
+                text: "Note body".to_string(),
+            },
+            "Question",
+        )
+        .unwrap();
+
+        assert!(prompt.contains("Page: Inbox"));
+        assert!(prompt.contains("页面正文：\nNote body"));
+        assert!(prompt.contains("我选中的内容/问题：\nQuestion"));
+    }
 
     #[test]
     fn discovers_model3_files() {
